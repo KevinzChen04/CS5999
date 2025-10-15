@@ -11,13 +11,14 @@ This resembles Section 2.4 of the DART paper (PLDI'05).
 
 from mc import *
 
-def test_me(x, y):
-  z = 2 * x
-  if z == y:
-    if y == x + 10:
-      assert False
+def popcount(x):
+  if x == 0:
+    return 0
+  return popcount(x >> 1) + (x & 1)
 
-x = BitVec("x", 32)
-y = BitVec("y", 32)
-test_me(x, y)
-#mc_fuzz(lambda: test_me(x, y), [x, y], [0, 0])
+def test_me(x):
+  assert(popcount(x) < x) 
+  
+
+x = BitVec("x", 4)
+test_me(x)
