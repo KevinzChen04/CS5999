@@ -6,6 +6,7 @@ Reads input from input.txt file and solves the Sudoku puzzle.
 
 from z3 import *
 import sys
+import time
 
 def read_input(filename):
     """
@@ -40,15 +41,15 @@ def create_sudoku_solver():
     """
     Create Z3 solver for 9x9 Sudoku puzzle.
     """
-    # Create 9x9 grid of integer variables
-    cells = [[Int(f"cell_{i}_{j}") for j in range(9)] for i in range(9)]
+    # Create 9x9 grid of bit-vector variables (4 bits for values 1-9)
+    cells = [[BitVec(f"cell_{i}_{j}", 4) for j in range(9)] for i in range(9)]
     
     solver = Solver()
     
-    # Each cell must be between 1 and 9
+    # Each cell must be between 1 and 9 (using unsigned comparison for BitVec)
     for i in range(9):
         for j in range(9):
-            solver.add(And(cells[i][j] >= 1, cells[i][j] <= 9))
+            solver.add(And(UGE(cells[i][j], 1), ULE(cells[i][j], 9)))
     
     # Each row must contain all digits 1-9
     for i in range(9):
@@ -117,13 +118,18 @@ def main():
     input_file = "input.txt"
 
     givens = read_input(input_file)
+    
+    print("Solving Sudoku puzzle...")
+    start_time = time.time()
     solution = solve_sudoku(givens)
+    end_time = time.time()
+    elapsed_time = end_time - start_time
     
     if solution:
-        print("\nSolution found!")
+        print(f"\nSolution found in {elapsed_time:.4f} seconds!")
         print_sudoku(solution)
     else:
-        print("\nNo solution exists for this Sudoku puzzle.")
+        print(f"\nNo solution exists for this Sudoku puzzle. (Checked in {elapsed_time:.4f} seconds)")
 
 if __name__ == "__main__":
     main()
