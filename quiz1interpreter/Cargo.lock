@@ -271,9 +271,9 @@ checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 
 [[package]]
 name = "patronus"
-version = "0.34.1"
+version = "0.34.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5868a79ec5c045394c452354bf76e949536e9b0638cecec7c105e22ed8968f44"
+checksum = "692bc0444e0d946bb87bff5bb9918e22b753e90c157a0459d95cbec68dbd4f7f"
 dependencies = [
  "baa",
  "boolean_expression",

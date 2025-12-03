@@ -1,0 +1,1 @@
+cargo run -- --output-path Quiz1.fst --steps 3 Quiz1.btor
