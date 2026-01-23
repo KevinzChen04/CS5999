@@ -13,7 +13,6 @@ pub struct ExecutionPath {
     /// Path conditions (constraints that don't define variables)
     pub path_conditions: Vec<ExprRef>,
     /// Translation map from original symbols to their current values
-    /// Only untranslatable values are input symbols and uninitialized state symbols
     pub translations: HashMap<ExprRef, ExprRef>,
 }
 
@@ -55,7 +54,7 @@ impl SymbolicExecutor {
     }
 
     /// Initialize the symbolic executor
-    /// Sets up initial state variables as name_t0, unless they have an initial value
+    /// Sets up initial state variables with their init values or as symbolic variables (no timestamps)
     /// Sets up inputs as name_t0
     pub fn init(&mut self, ctx: &mut Context) {
         // Collect state and input types
@@ -71,48 +70,24 @@ impl SymbolicExecutor {
         // Create initial execution path
         let mut initial_path = ExecutionPath::new();
 
-        // Initialize state variables in the translation map
+        // Initialize state variables directly in variable_definitions (no timestamps)
         for state in &self.ts.states {
-            let original_name = ctx.get_symbol_name(state.symbol).unwrap_or("state");
-            
             if let Some(init_expr) = state.init {
-                // If it has an initial value, translate directly to that value
-                initial_path.translations.insert(state.symbol, init_expr);
+                // If it has an initial value, put it directly in variable_definitions
+                initial_path.variable_definitions.insert(state.symbol, init_expr);
             } else {
-                // No initial value, create symbolic variable name_t0
-                // This is an untranslatable symbol
-                let timestamped_name = format!("{}_t0", original_name);
-                let tpe = self.state_types[&state.symbol];
-                let timestamped_sym = match tpe {
-                    Type::BV(width) => ctx.bv_symbol(&timestamped_name, width),
-                    Type::Array(arr_type) => {
-                        ctx.array_symbol(&timestamped_name, arr_type.index_width, arr_type.data_width)
-                    }
-                };
-                initial_path.translations.insert(state.symbol, timestamped_sym);
+                // No initial value - store the symbol itself in variable_definitions
+                initial_path.variable_definitions.insert(state.symbol, state.symbol);
             }
         }
 
-        // Initialize input variables in the translation map
-        // Inputs are always untranslatable symbols
-        for input in &self.ts.inputs {
-            let original_name = ctx.get_symbol_name(*input).unwrap_or("input");
-            let timestamped_name = format!("{}_t0", original_name);
-            let tpe = self.input_types[input];
-            let timestamped_sym = match tpe {
-                Type::BV(width) => ctx.bv_symbol(&timestamped_name, width),
-                Type::Array(arr_type) => {
-                    ctx.array_symbol(&timestamped_name, arr_type.index_width, arr_type.data_width)
-                }
-            };
-            initial_path.translations.insert(*input, timestamped_sym);
-        }
+        // No inputs at step 0 - they will be created when we call step() for the first time
 
         self.paths.push(initial_path);
         self.current_step = 0;
     }
 
-    /// Substitute all symbols in an expression using the translation map
+    /// Substitute all symbols in an expression using the translation map and variable definitions
     fn substitute_expr(
         &self,
         ctx: &mut Context,
@@ -122,11 +97,15 @@ impl SymbolicExecutor {
         use patronus::expr::simple_transform_expr;
         
         let translations = &path.translations;
+        let definitions = &path.variable_definitions;
         
         simple_transform_expr(ctx, expr, |_ctx, e, _children| {
-            // Check if this is a symbol we need to translate
+            // Check if this is a symbol we need to translate (inputs)
             if translations.contains_key(&e) {
                 Some(translations[&e])
+            } else if definitions.contains_key(&e) {
+                // Check if this is a state variable in definitions
+                Some(definitions[&e])
             } else {
                 None // No translation
             }
@@ -134,34 +113,51 @@ impl SymbolicExecutor {
     }
 
     /// Substitute variable definitions into an expression recursively until fixed point
+    /// Avoids infinite loops by limiting recursion depth
     fn substitute_definitions(
         ctx: &mut Context,
         expr: ExprRef,
         definitions: &HashMap<ExprRef, ExprRef>,
     ) -> ExprRef {
+        Self::substitute_definitions_depth(ctx, expr, definitions, &mut HashSet::new())
+    }
+
+    /// Helper for substitute_definitions that tracks visited symbols to avoid cycles
+    fn substitute_definitions_depth(
+        ctx: &mut Context,
+        expr: ExprRef,
+        definitions: &HashMap<ExprRef, ExprRef>,
+        visiting: &mut HashSet<ExprRef>,
+    ) -> ExprRef {
         use patronus::expr::simple_transform_expr;
         
-        let mut current = expr;
-        let mut prev = expr;
-        
-        // Keep substituting until no more changes (fixed point)
-        loop {
-            current = simple_transform_expr(ctx, current, |_ctx, e, _children| {
-                // Check if this is a defined variable we need to substitute
-                if definitions.contains_key(&e) {
-                    Some(definitions[&e])
-                } else {
-                    None // No substitution
+        simple_transform_expr(ctx, expr, |ctx, e, _children| {
+            // Check if this is a defined variable we need to substitute
+            if definitions.contains_key(&e) {
+                // Avoid infinite recursion - if we're already visiting this symbol, don't substitute
+                if visiting.contains(&e) {
+                    return None;
                 }
-            });
-            
-            if current == prev {
-                break;
+                
+                // Mark this symbol as being visited
+                visiting.insert(e);
+                let value = definitions[&e];
+                
+                // If the value is the symbol itself, don't substitute
+                if value == e {
+                    visiting.remove(&e);
+                    return None;
+                }
+                
+                // Recursively substitute in the value
+                let result = Self::substitute_definitions_depth(ctx, value, definitions, visiting);
+                visiting.remove(&e);
+                
+                Some(result)
+            } else {
+                None // No substitution
             }
-            prev = current;
-        }
-        
-        current
+        })
     }
 
     /// Check if an expression is an ITE and return its components
@@ -300,27 +296,18 @@ impl SymbolicExecutor {
         let states: Vec<_> = self.ts.states.clone();
 
         for path in &self.paths {
-            // Create base path with new timestamped variables
-            let mut base_path = path.clone();
-
-            // Create new timestamped state variables and update translations
-            for state in &states {
-                let original_name = ctx.get_symbol_name(state.symbol).unwrap_or("state");
-                let timestamped_name = format!("{}_t{}", original_name, next_step);
-                let tpe = self.state_types[&state.symbol];
-                let timestamped_sym = match tpe {
-                    Type::BV(width) => ctx.bv_symbol(&timestamped_name, width),
-                    Type::Array(arr_type) => {
-                        ctx.array_symbol(&timestamped_name, arr_type.index_width, arr_type.data_width)
-                    }
-                };
-                base_path.translations.insert(state.symbol, timestamped_sym);
-            }
+            // Create base path - state variables will keep their original symbols
+            let mut base_path = ExecutionPath::new();
+            
+            // Copy existing path conditions (but not variable definitions - we'll create new ones)
+            base_path.path_conditions = path.path_conditions.clone();
 
             // Create new timestamped input variables and update translations
+            // First input is at step 1, so we use step - 1 for the timestamp (input_t0 at step 1)
+            let input_timestamp = next_step - 1;
             for input in &self.ts.inputs {
                 let original_name = ctx.get_symbol_name(*input).unwrap_or("input");
-                let timestamped_name = format!("{}_t{}", original_name, next_step);
+                let timestamped_name = format!("{}_t{}", original_name, input_timestamp);
                 let tpe = self.input_types[input];
                 let timestamped_sym = match tpe {
                     Type::BV(width) => ctx.bv_symbol(&timestamped_name, width),
@@ -333,13 +320,29 @@ impl SymbolicExecutor {
 
             // Add transition system constraints
             for &constraint in &self.ts.constraints {
-                let substituted = self.substitute_expr(ctx, constraint, &base_path);
-                base_path.path_conditions.push(substituted);
+                // Create a temporary path that combines old state values with new input translations
+                let mut combined_path = ExecutionPath::new();
+                combined_path.variable_definitions = path.variable_definitions.clone();
+                combined_path.translations = base_path.translations.clone();
+                
+                let substituted = self.substitute_expr(ctx, constraint, &combined_path);
+                // Simplify the constraint before adding it
+                let simplified = simplify_single_expression(ctx, substituted);
+                // Only add non-tautology constraints
+                if !Self::is_tautology(ctx, simplified) {
+                    base_path.path_conditions.push(simplified);
+                }
             }
 
             // DFS exploration of state transitions
             // Stack contains: (current_path, state_index)
-            let mut stack: Vec<(ExecutionPath, usize)> = vec![(base_path, 0)];
+            let mut stack: Vec<(ExecutionPath, usize)> = vec![(base_path.clone(), 0)];
+
+            // Create a combined path for substituting next expressions
+            // It has old state values but new input translations
+            let mut combined_path_for_next = ExecutionPath::new();
+            combined_path_for_next.variable_definitions = path.variable_definitions.clone();
+            combined_path_for_next.translations = base_path.translations.clone();
 
             while let Some((current_path, state_idx)) = stack.pop() {
                 if state_idx >= states.len() {
@@ -350,12 +353,11 @@ impl SymbolicExecutor {
 
                 let state = &states[state_idx];
                 let next_expr = if let Some(next) = state.next {
-                    // Substitute using the ORIGINAL path's translations (before we updated them)
-                    // We need to use the values from the previous step
-                    self.substitute_expr(ctx, next, path)
+                    // Substitute using the combined path (old state values + new input translations)
+                    self.substitute_expr(ctx, next, &combined_path_for_next)
                 } else {
                     // No next expression - state stays the same
-                    path.translations[&state.symbol]
+                    path.variable_definitions[&state.symbol]
                 };
 
                 // Process the expression, handling nested ITEs with DFS
@@ -406,8 +408,8 @@ impl SymbolicExecutor {
                 }
             } else {
                 // Not an ITE - this is a final value for this state
-                let new_state_sym = current_path.translations[&state_symbol];
-                current_path.variable_definitions.insert(new_state_sym, current_expr);
+                // State variables use their original symbol (no timestamp)
+                current_path.variable_definitions.insert(state_symbol, current_expr);
                 
                 // Push to main stack to continue with next state
                 stack.push((current_path, state_idx + 1));
@@ -529,29 +531,18 @@ impl SymbolicExecutor {
         println!("Step {}:", self.current_step);
         
         if self.current_step == 0 {
-            // Initial step - print variable definitions for initial values
+            // Initial step - print only state variable definitions (no inputs yet)
             if let Some(path) = self.paths.first() {
                 println!("  Variables:");
+                // Print state variables from variable_definitions
                 for state in &self.ts.states {
                     let original_name = ctx.get_symbol_name(state.symbol).unwrap_or("state").to_string();
-                    if let Some(&value) = path.translations.get(&state.symbol) {
+                    if let Some(&value) = path.variable_definitions.get(&state.symbol) {
                         let value_str = value.serialize_to_str(ctx);
-                        // Only print if it's a concrete value (not a symbol referring to itself)
-                        if ctx[value].is_symbol() {
-                            let sym_name = ctx.get_symbol_name(value).unwrap_or("unknown");
-                            println!("    {} = {}", original_name, sym_name);
-                        } else {
-                            println!("    {} = {}", original_name, value_str);
-                        }
+                        println!("    {} = {}", original_name, value_str);
                     }
                 }
-                for input in &self.ts.inputs {
-                    let original_name = ctx.get_symbol_name(*input).unwrap_or("input").to_string();
-                    if let Some(&value) = path.translations.get(input) {
-                        let sym_name = ctx.get_symbol_name(value).unwrap_or("unknown");
-                        println!("    {} = {}", original_name, sym_name);
-                    }
-                }
+                // Don't print inputs at step 0 - they don't exist yet
             }
         } else {
             // After step - print all paths with variables and constraints
@@ -560,13 +551,25 @@ impl SymbolicExecutor {
                 
                 // Print variable definitions (substituted and simplified)
                 println!("    Variables:");
-                for (&sym, &value) in &path.variable_definitions {
-                    let sym_name = ctx.get_symbol_name(sym).unwrap_or("unknown").to_string();
-                    // Substitute other variable definitions into this value
-                    let substituted = Self::substitute_definitions(ctx, value, &path.variable_definitions);
-                    // Simplify the result
-                    let simplified = simplify_single_expression(ctx, substituted);
-                    println!("      {} = {}", sym_name, simplified.serialize_to_str(ctx));
+                
+                // Print state variables
+                for state in &self.ts.states {
+                    if let Some(&value) = path.variable_definitions.get(&state.symbol) {
+                        let sym_name = ctx.get_symbol_name(state.symbol).unwrap_or("unknown").to_string();
+                        // For state variables, just simplify without recursive substitution
+                        // (to avoid expanding self-references like counter in add(counter, 1))
+                        let simplified = simplify_single_expression(ctx, value);
+                        println!("      {} = {}", sym_name, simplified.serialize_to_str(ctx));
+                    }
+                }
+                
+                // Print input variables (timestamped)
+                for input in &self.ts.inputs {
+                    let original_name = ctx.get_symbol_name(*input).unwrap_or("input").to_string();
+                    if let Some(&value) = path.translations.get(input) {
+                        let sym_name = ctx.get_symbol_name(value).unwrap_or("unknown");
+                        println!("      {} = {}", original_name, sym_name);
+                    }
                 }
                 
                 // Substitute variable definitions into constraints, simplify, and filter tautologies
