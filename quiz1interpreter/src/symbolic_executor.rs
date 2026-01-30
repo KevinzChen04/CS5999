@@ -1,5 +1,4 @@
-use baa::BitVecOps;
-use patronus::expr::{Context, Expr, ExprRef, ForEachChild, SerializableIrNode, Type, TypeCheck, simplify_single_expression, simple_transform_expr};
+use patronus::expr::{Context, Expr, ExprRef, SerializableIrNode, Type, TypeCheck, simplify_single_expression, simple_transform_expr};
 use patronus::smt::{CheckSatResponse, SolverContext};
 use patronus::system::TransitionSystem;
 use std::collections::{HashMap, HashSet};
@@ -7,12 +6,15 @@ use std::collections::{HashMap, HashSet};
 /// Represents a single execution path with its constraints
 #[derive(Clone)]
 pub struct ExecutionPath {
-    /// Variable definitions: maps timestamped symbols to their values
-    /// e.g., input_t1 -> 16'x0000, counter -> 16'x0001
+    /// Variable definitions: maps state variables to their values
+    /// e.g., counter -> 16'x0001
     pub variable_definitions: HashMap<ExprRef, ExprRef>,
-    /// Path conditions (constraints that don't define variables)
+    /// Path conditions
     pub path_conditions: Vec<ExprRef>,
-    /// Translation map from original symbols to their current values
+    /// Transition system constraints (inherited from the system)
+    pub constraints: Vec<ExprRef>,
+    /// Translation map inputs to their input state
+    /// e.g., input -> input_t1
     pub input_translation: HashMap<ExprRef, ExprRef>,
 }
 
@@ -21,6 +23,7 @@ impl ExecutionPath {
         ExecutionPath {
             variable_definitions: HashMap::new(),
             path_conditions: Vec::new(),
+            constraints: Vec::new(),
             input_translation: HashMap::new(),
         }
     }
@@ -38,6 +41,8 @@ pub struct SymbolicExecutor {
     state_types: HashMap<ExprRef, Type>,
     /// Mapping from original input symbols to their types
     input_types: HashMap<ExprRef, Type>,
+    /// All symbols used across all paths 
+    all_symbols: HashSet<ExprRef>,
 }
 
 impl SymbolicExecutor {
@@ -50,6 +55,7 @@ impl SymbolicExecutor {
             paths: Vec::new(),
             state_types: HashMap::new(),
             input_types: HashMap::new(),
+            all_symbols: HashSet::new(),
         }
     }
 
@@ -59,6 +65,7 @@ impl SymbolicExecutor {
         for state in &self.ts.states {
             let tpe = state.symbol.get_type(ctx);
             self.state_types.insert(state.symbol, tpe);
+            self.all_symbols.insert(state.symbol);
         }
         for input in &self.ts.inputs {
             let tpe = input.get_type(ctx);
@@ -75,6 +82,13 @@ impl SymbolicExecutor {
                 // No initial value - store the symbol itself in variable_definitions
                 initial_path.variable_definitions.insert(state.symbol, state.symbol);
             }
+        }
+
+        // Add transition system constraints to initial path
+        // These will be inherited by all divergent paths
+        for &constraint in &self.ts.constraints {
+            let simplified = simplify_single_expression(ctx, constraint);
+            initial_path.constraints.push(simplified);
         }
 
         self.paths.push(initial_path);
@@ -99,7 +113,7 @@ impl SymbolicExecutor {
                 // Check if this is a state variable in definitions
                 Some(definitions[&e])
             } else {
-                None // No translation
+                None 
             }
         })
     }
@@ -113,61 +127,6 @@ impl SymbolicExecutor {
         }
     }
 
-    /// Check if an expression is always true or always false using SMT solver
-    /// Returns: Some(true) if always true, Some(false) if always false, None if neithers
-    fn check_always_true_or_false<S: SolverContext>(
-        &self,
-        ctx: &mut Context,
-        solver: &mut S,
-        expr: ExprRef,
-    ) -> Option<bool> {
-        if solver.push().is_err() {
-            return None;
-        }
-
-        // Collect and declare all symbols
-        let mut all_symbols = HashSet::new();
-        self.collect_symbols(ctx, expr, &mut all_symbols);
-
-        for sym in &all_symbols {
-            let _ = solver.declare_const(ctx, *sym);
-        }
-
-        // Check if expression is always false (UNSAT)
-        let _ = solver.assert(ctx, expr);
-        let is_always_false = match solver.check_sat() {
-            Ok(CheckSatResponse::Unsat) => true,
-            _ => false,
-        };
-        let _ = solver.pop();
-
-        if is_always_false {
-            return Some(false);
-        }
-
-        // Check if expression is always true (negation is UNSAT)
-        if solver.push().is_err() {
-            return None;
-        }
-
-        for sym in &all_symbols {
-            let _ = solver.declare_const(ctx, *sym);
-        }
-
-        let neg_expr = ctx.not(expr);
-        let _ = solver.assert(ctx, neg_expr);
-        let is_always_true = match solver.check_sat() {
-            Ok(CheckSatResponse::Unsat) => true,
-            _ => false,
-        };
-        let _ = solver.pop();
-
-        if is_always_true {
-            Some(true)
-        } else {
-            None
-        }
-    }
 
     /// Check if a condition is satisfiable given current path conditions
     /// Returns: Some(true) if SAT, Some(false) if UNSAT, None if neither
@@ -182,18 +141,7 @@ impl SymbolicExecutor {
             return None;
         }
 
-        // Collect and declare all symbols
-        let mut all_symbols = HashSet::new();
-        for (&sym, &value) in &path.variable_definitions {
-            let eq = ctx.equal(sym, value);
-            self.collect_symbols(ctx, eq, &mut all_symbols);
-        }
-        for &pc in &path.path_conditions {
-            self.collect_symbols(ctx, pc, &mut all_symbols);
-        }
-        self.collect_symbols(ctx, condition, &mut all_symbols);
-
-        for sym in &all_symbols {
+        for sym in &self.all_symbols {
             let _ = solver.declare_const(ctx, *sym);
         }
 
@@ -201,6 +149,9 @@ impl SymbolicExecutor {
         for (&sym, &value) in &path.variable_definitions {
             let eq = ctx.equal(sym, value);
             let _ = solver.assert(ctx, eq);
+        }
+        for &constraint in &path.constraints {
+            let _ = solver.assert(ctx, constraint);
         }
         for &pc in &path.path_conditions {
             let _ = solver.assert(ctx, pc);
@@ -232,7 +183,7 @@ impl SymbolicExecutor {
     ) -> Vec<(ExprRef, Option<ExprRef>)> {
         let mut branches = Vec::new();
 
-        // Check if path ∧ cond is SAT (2 SMT calls total)
+        // Check if path ∧ cond is SAT
         let cond_sat = self.check_condition_sat(ctx, solver, path, cond);
         
         // Check if path ∧ ¬cond is SAT
@@ -247,20 +198,15 @@ impl SymbolicExecutor {
                 branches.push((fals, Some(neg_cond)));
             }
             (Some(true), Some(false)) => {
-                // path ∧ cond = SAT, path ∧ ¬cond = UNSAT
-                // This means cond must be TRUE given path (¬cond is FALSE)
-                // Therefore cond is redundant - take true branch WITHOUT adding condition
+                // cond is redundant - take true branch without adding condition
                 branches.push((tru, None));
             }
             (Some(false), Some(true)) => {
-                // path ∧ cond = UNSAT, path ∧ ¬cond = SAT
-                // This means cond must be FALSE given path (¬cond is TRUE)
-                // Therefore ¬cond is redundant - take false branch WITHOUT adding condition
+                // not cond is redundant - take false branch without adding condition
                 branches.push((fals, None));
             }
             (Some(false), Some(false)) => {
-                // Both UNSAT - path is infeasible (impossible case)
-                // Return empty to signal infeasibility
+                // Both UNSAT - path is infeasible
             }
             _ => {
                 // Unknown - conservatively explore both
@@ -281,40 +227,30 @@ impl SymbolicExecutor {
         let mut new_paths = Vec::new();
         let states: Vec<_> = self.ts.states.clone();
 
+        // Create new timestamped input symbols once per step and add to global symbol set
+        let input_timestamp = next_step - 1;
+        let mut timestamped_inputs = HashMap::new();
+        for input in &self.ts.inputs {
+            let original_name = ctx.get_symbol_name(*input).unwrap_or("input");
+            let timestamped_name = format!("{}_t{}", original_name, input_timestamp);
+            let tpe = self.input_types[input];
+            let timestamped_sym = match tpe {
+                Type::BV(width) => ctx.bv_symbol(&timestamped_name, width),
+                Type::Array(arr_type) => {
+                    ctx.array_symbol(&timestamped_name, arr_type.index_width, arr_type.data_width)
+                }
+            };
+            timestamped_inputs.insert(*input, timestamped_sym);
+            self.all_symbols.insert(timestamped_sym);
+        }
+
         for path in &self.paths {
             let mut base_path = ExecutionPath::new();
             base_path.path_conditions = path.path_conditions.clone();
+            base_path.constraints = path.constraints.clone();
 
-            // Create new timestamped input variables and update translations
-            let input_timestamp = next_step - 1;
-            for input in &self.ts.inputs {
-                let original_name = ctx.get_symbol_name(*input).unwrap_or("input");
-                let timestamped_name = format!("{}_t{}", original_name, input_timestamp);
-                let tpe = self.input_types[input];
-                let timestamped_sym = match tpe {
-                    Type::BV(width) => ctx.bv_symbol(&timestamped_name, width),
-                    Type::Array(arr_type) => {
-                        ctx.array_symbol(&timestamped_name, arr_type.index_width, arr_type.data_width)
-                    }
-                };
-                base_path.input_translation.insert(*input, timestamped_sym);
-            }
-
-            // Add transition system constraints
-            // for &constraint in &self.ts.constraints {
-            //     // Create a temporary path that combines old state values with new input translations
-            //     let mut combined_path = ExecutionPath::new();
-            //     combined_path.variable_definitions = path.variable_definitions.clone();
-            //     combined_path.input_translation = base_path.input_translation.clone();
-                
-            //     let substituted = self.substitute_expr(ctx, constraint, &combined_path);
-            //     let simplified = simplify_single_expression(ctx, substituted); 
-
-            //     // Only add non-tautology constraints
-            //     if !self.is_tautology(ctx, solver, simplified) {
-            //         base_path.path_conditions.push(simplified);
-            //     }
-            // }
+            // Use the pre-created timestamped inputs
+            base_path.input_translation = timestamped_inputs.clone();
 
             // DFS exploration of state transitions
             // Stack contains: (current_path, state_index)
@@ -392,19 +328,6 @@ impl SymbolicExecutor {
         }
     }
 
-    /// Collect all symbols used in an expression
-    fn collect_symbols(&self, ctx: &Context, expr: ExprRef, symbols: &mut HashSet<ExprRef>) {
-        // Check if this is a symbol
-        if ctx[expr].is_symbol() {
-            symbols.insert(expr);
-        }
-        
-        // Recursively collect from children
-        ctx[expr].for_each_child(|child| {
-            self.collect_symbols(ctx, *child, symbols);
-        });
-    }
-
     /// Get the current step number
     pub fn current_step(&self) -> usize {
         self.current_step
@@ -420,64 +343,40 @@ impl SymbolicExecutor {
         &self.ts
     }
 
-    /// Check if an expression is a tautology (always true) using SMT solver
-    fn is_tautology<S: SolverContext>(
-        &self,
-        ctx: &mut Context,
-        solver: &mut S,
-        expr: ExprRef,
-    ) -> bool {
-        self.check_always_true_or_false(ctx, solver, expr) == Some(true)
-    }
-
     /// Print the current state of symbolic execution
     pub fn print_step(&self, ctx: &mut Context) {
         println!("Step {}:", self.current_step);
-        
-        if self.current_step == 0 {
-            if let Some(path) = self.paths.first() {
-                println!("  Variables:");
-                for state in &self.ts.states {
-                    let original_name = ctx.get_symbol_name(state.symbol).unwrap_or("state").to_string();
-                    if let Some(&value) = path.variable_definitions.get(&state.symbol) {
-                        let value_str = value.serialize_to_str(ctx);
-                        println!("    {} = {}", original_name, value_str);
-                    }
-                }
-            }
-        } else {
-            // After step - print all paths with variables and constraints
-            for (path_idx, path) in self.paths.iter().enumerate() {
-                println!("  Path_condition {}:", path_idx + 1); 
 
-                println!("    Variables:");
-                for state in &self.ts.states {
-                    if let Some(&value) = path.variable_definitions.get(&state.symbol) {
-                        let sym_name = ctx.get_symbol_name(state.symbol).unwrap_or("unknown").to_string();
-                        let simplified = simplify_single_expression(ctx, value);
-                        println!("      {} = {}", sym_name, simplified.serialize_to_str(ctx));
-                    }
+        for (path_idx, path) in self.paths.iter().enumerate() {
+            println!("  Path_condition {}:", path_idx + 1); 
+
+            println!("    Variables:");
+            for state in &self.ts.states {
+                if let Some(&value) = path.variable_definitions.get(&state.symbol) {
+                    let sym_name = ctx.get_symbol_name(state.symbol).unwrap_or("unknown").to_string();
+                    let simplified = simplify_single_expression(ctx, value);
+                    println!("      {} = {}", sym_name, simplified.serialize_to_str(ctx));
                 }
-                
-                for input in &self.ts.inputs {
-                    let original_name = ctx.get_symbol_name(*input).unwrap_or("input").to_string();
-                    if let Some(&value) = path.input_translation.get(input) {
-                        let sym_name = ctx.get_symbol_name(value).unwrap_or("unknown");
-                        println!("      {} = {}", original_name, sym_name);
-                    }
-                }
-                
-                println!("    Path Constraints:");
-                let mut constraint_idx = 0;
-                for &constraint in &path.path_conditions {
-                    let substituted = self.substitute_expr(ctx, constraint, &path);
-                    let simplified = simplify_single_expression(ctx, substituted);
-                    println!("      Constraint {}: {}", constraint_idx, simplified.serialize_to_str(ctx));
-                    constraint_idx += 1;
-                }
-                
-                println!();
             }
+            
+            for input in &self.ts.inputs {
+                let original_name = ctx.get_symbol_name(*input).unwrap_or("input").to_string();
+                if let Some(&value) = path.input_translation.get(input) {
+                    let sym_name = ctx.get_symbol_name(value).unwrap_or("unknown");
+                    println!("      {} = {}", original_name, sym_name);
+                }
+            }
+            
+            println!("    Path Constraints:");
+            let mut constraint_idx = 0;
+            for &constraint in &path.path_conditions {
+                let substituted = self.substitute_expr(ctx, constraint, &path);
+                let simplified = simplify_single_expression(ctx, substituted);
+                println!("      Constraint {}: {}", constraint_idx, simplified.serialize_to_str(ctx));
+                constraint_idx += 1;
+            }
+            
+            println!();
         }
     }
 }
