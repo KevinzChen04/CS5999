@@ -3,12 +3,12 @@ use patronus::smt::{CheckSatResponse, SolverContext};
 use patronus::system::TransitionSystem;
 use std::collections::{HashMap, HashSet};
 
-/// Represents a single execution path with its constraints
 #[derive(Clone)]
 pub struct ExecutionPath {
     pub state_translation: HashMap<ExprRef, ExprRef>,
     pub path_conditions: Vec<ExprRef>,
     pub input_translation: HashMap<ExprRef, ExprRef>,
+    pub new_state_cache: HashMap<ExprRef, ExprRef>,
 }
 
 impl ExecutionPath {
@@ -17,6 +17,7 @@ impl ExecutionPath {
             state_translation: HashMap::new(),
             path_conditions: Vec::new(),
             input_translation: HashMap::new(),
+            new_state_cache: HashMap::new(),
         }
     }
 
@@ -44,7 +45,6 @@ impl ExecutionPath {
     }
 }
 
-/// Symbolic executor for transition systems
 pub struct SymbolicExecutor {
     ts: TransitionSystem,
     current_step: usize,
@@ -81,20 +81,23 @@ impl SymbolicExecutor {
         let mut initial_path = ExecutionPath::new();
 
         for state in &self.ts.states {
-            // All states start as state_t0 symbols, regardless of init values.
-            // On the first step, states with init values will be set to their
-            // init value instead of stepping.
-            let name = ctx.get_symbol_name(state.symbol).unwrap_or("state");
-            let t0_name = format!("{}_t0", name);
-            let tpe = self.state_types[&state.symbol];
-            let t0_sym = match tpe {
-                Type::BV(width) => ctx.bv_symbol(&t0_name, width),
-                Type::Array(arr_type) => {
-                    ctx.array_symbol(&t0_name, arr_type.index_width, arr_type.data_width)
-                }
-            };
-            initial_path.state_translation.insert(state.symbol, t0_sym);
-            self.all_symbols.insert(t0_sym);
+            if let Some(init_expr) = state.init {
+                // States with init values start as their init value directly.
+                initial_path.state_translation.insert(state.symbol, init_expr);
+            } else {
+                // States without init values start as a fresh t0 symbol.
+                let name = ctx.get_symbol_name(state.symbol).unwrap_or("state");
+                let t0_name = format!("{}_t0", name);
+                let tpe = self.state_types[&state.symbol];
+                let t0_sym = match tpe {
+                    Type::BV(width) => ctx.bv_symbol(&t0_name, width),
+                    Type::Array(arr_type) => {
+                        ctx.array_symbol(&t0_name, arr_type.index_width, arr_type.data_width)
+                    }
+                };
+                initial_path.state_translation.insert(state.symbol, t0_sym);
+                self.all_symbols.insert(t0_sym);
+            }
         }
 
         self.constraints = self.ts.constraints.clone();
@@ -152,6 +155,13 @@ impl SymbolicExecutor {
             let _ = solver.assert(ctx, simplified);
         }
 
+        let constraints = self.constraints.clone();
+        for &constraint in &constraints {
+            let substituted = self.substitute_expr(ctx, constraint, &path);
+            let simplified = simplify_single_expression(ctx, substituted);
+            let _ = solver.assert(ctx, simplified);
+        }
+
         let substituted_cond = self.substitute_expr(ctx, condition, path);
         let simplified_cond = simplify_single_expression(ctx, substituted_cond);
         let _ = solver.assert(ctx, simplified_cond);
@@ -165,58 +175,6 @@ impl SymbolicExecutor {
         let _ = solver.pop();
         result
     }
-
-
-    fn prune_infeasible_paths<S: SolverContext>(
-        &self,
-        ctx: &mut Context,
-        solver: &mut S,
-        path_stack: Vec<ExecutionPath>,
-    ) -> Vec<ExecutionPath> {
-
-        let mut feasible_paths = Vec::new();
-
-        for path in path_stack {
-
-            if solver.push().is_err() {
-                // If push fails, conservatively keep the path
-                feasible_paths.push(path);
-                continue;
-            }
-
-            for sym in &self.all_symbols {
-                let _ = solver.declare_const(ctx, *sym);
-            }
-
-            let constraints = self.constraints.clone();
-            for &constraint in &constraints {
-                let substituted = self.substitute_expr(ctx, constraint, &path);
-                let simplified = simplify_single_expression(ctx, substituted);
-                let _ = solver.assert(ctx, simplified);
-            }
-
-            for &pc in &path.path_conditions {
-                let substituted = self.substitute_expr(ctx, pc, &path);
-                let simplified = simplify_single_expression(ctx, substituted);
-                let _ = solver.assert(ctx, simplified);
-            }
-
-            let result = solver.check_sat();
-            let is_sat = match &result {
-                Ok(CheckSatResponse::Sat) => true,
-                Ok(CheckSatResponse::Unsat) => false,
-                _ => panic!("got unexpected SAT response (not SAT or UNSAT)"),
-            };
-            let _ = solver.pop();
-
-            if is_sat {
-                feasible_paths.push(path);
-            }
-        }
-
-        feasible_paths
-    }
-
 
     fn explore_paths<S: SolverContext>(
         &self,
@@ -232,7 +190,7 @@ impl SymbolicExecutor {
             let substituted = self.substitute_expr(ctx, next_expr, &path_stack[i]);
             let simplified = simplify_single_expression(ctx, substituted);
             let new_state = self.resolve_ite(ctx, solver, i, path_stack, simplified);
-            path_stack[i].state_translation.insert(state_symbol, new_state);
+            path_stack[i].new_state_cache.insert(state_symbol, new_state);
 
             i += 1;
         }
@@ -255,22 +213,18 @@ impl SymbolicExecutor {
         expr: ExprRef,
     ) -> ExprRef {
         if let Some((cond, tru, fals)) = self.get_ite_components(ctx, expr) {
-            // Check feasibility of both branches under the current path conditions
             let cond_sat = self.check_condition_sat(ctx, solver, &path_stack[i], cond);
             let neg_cond = ctx.not(cond);
             let neg_sat = self.check_condition_sat(ctx, solver, &path_stack[i], neg_cond);
 
             match (cond_sat, neg_sat) {
                 (Some(true), Some(false)) => {
-                    // Only the true branch is feasible
                     self.resolve_ite(ctx, solver, i, path_stack, tru)
                 }
                 (Some(false), Some(true)) => {
-                    // Only the false branch is feasible
                     self.resolve_ite(ctx, solver, i, path_stack, fals)
                 }
                 (Some(true), Some(true)) => {
-                    // Both branches are feasible — fork the path
                     let mut forked_path = path_stack[i].clone();
                     path_stack[i].path_conditions.push(cond);
                     forked_path.path_conditions.push(neg_cond);
@@ -285,7 +239,6 @@ impl SymbolicExecutor {
                 }
             }
         } else {
-            // Not an ITE — collect children, resolve each, and rebuild if any changed
             let mut children = Vec::new();
             ctx[expr].for_each_child(|c| children.push(*c));
 
@@ -307,14 +260,12 @@ impl SymbolicExecutor {
                 return expr;
             }
 
-            // Build a mapping from original children to resolved children
             let child_map: HashMap<ExprRef, ExprRef> = children
                 .iter()
                 .zip(resolved_children.iter())
                 .map(|(&old, &new)| (old, new))
                 .collect();
 
-            // Rebuild the expression with resolved children
             simple_transform_expr(ctx, expr, |_ctx, e, _| {
                 child_map.get(&e).copied()
             })
@@ -328,7 +279,6 @@ impl SymbolicExecutor {
     pub fn step<S: SolverContext>(&mut self, ctx: &mut Context, solver: &mut S) {
         self.current_step += 1;
         let next_step = self.current_step;
-        let is_first_step = next_step == 1;
         
         let mut new_paths = Vec::new();
         let states: Vec<_> = self.ts.states.clone();
@@ -357,27 +307,19 @@ impl SymbolicExecutor {
 
             let mut path_stack = vec![base_path];
 
-            if is_first_step {
-                for state in &states {
-                    if let Some(init_expr) = state.init {
-                        for p in path_stack.iter_mut() {
-                            p.state_translation.insert(state.symbol, init_expr);
-                        }
-                    } else if let Some(next_expr) = state.next {
-                        self.explore_paths(ctx, solver, &mut path_stack, state.symbol, next_expr);
-                    }
-                }
-            } else {
-                for state in &states {
-                    if let Some(next_expr) = state.next {
-                        self.explore_paths(ctx, solver, &mut path_stack, state.symbol, next_expr);
-                    }
+            for state in &states {
+                if let Some(next_expr) = state.next {
+                    self.explore_paths(ctx, solver, &mut path_stack, state.symbol, next_expr);
                 }
             }
 
-            let feasible_paths = self.prune_infeasible_paths(ctx, solver, path_stack);
+            for p in path_stack.iter_mut() {
+                for (key, value) in p.new_state_cache.iter() {
+                    p.state_translation.insert(*key, *value);
+                }
+            }
 
-            new_paths.extend(feasible_paths);
+            new_paths.extend(path_stack);
         }
 
         self.paths = new_paths;
