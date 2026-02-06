@@ -1,4 +1,4 @@
-use patronus::expr::{Context, Expr, ExprRef, SerializableIrNode, Type, TypeCheck, simplify_single_expression, simple_transform_expr};
+use patronus::expr::{Context, Expr, ExprRef, ForEachChild, SerializableIrNode, Type, TypeCheck, simplify_single_expression, simple_transform_expr};
 use patronus::smt::{CheckSatResponse, SolverContext};
 use patronus::system::TransitionSystem;
 use std::collections::{HashMap, HashSet};
@@ -6,66 +6,72 @@ use std::collections::{HashMap, HashSet};
 /// Represents a single execution path with its constraints
 #[derive(Clone)]
 pub struct ExecutionPath {
-    /// Variable definitions: maps state variables to their values
-    /// e.g., counter -> 16'x0001
-    pub variable_definitions: HashMap<ExprRef, ExprRef>,
-    /// Path conditions
+    pub state_translation: HashMap<ExprRef, ExprRef>,
     pub path_conditions: Vec<ExprRef>,
-    /// Transition system constraints (inherited from the system)
-    pub constraints: Vec<ExprRef>,
-    /// Translation map inputs to their input state
-    /// e.g., input -> input_t1
     pub input_translation: HashMap<ExprRef, ExprRef>,
 }
 
 impl ExecutionPath {
     pub fn new() -> Self {
         ExecutionPath {
-            variable_definitions: HashMap::new(),
+            state_translation: HashMap::new(),
             path_conditions: Vec::new(),
-            constraints: Vec::new(),
             input_translation: HashMap::new(),
         }
+    }
+
+    pub fn serialize_to_str(&self, ctx: &Context) -> String {
+        let mut result = String::new();
+        result.push_str("ExecutionPath {\n");
+
+        result.push_str("  variable_definitions:\n");
+        for (key, value) in &self.state_translation {
+            result.push_str(&format!("\t{} -> {}\n", key.serialize_to_str(ctx), value.serialize_to_str(ctx)));
+        }
+
+        result.push_str("  path_conditions:\n");
+        for cond in &self.path_conditions {
+            result.push_str(&format!("\t{}\n", cond.serialize_to_str(ctx)));
+        }
+
+        result.push_str("  input_translation:\n");
+        for (key, value) in &self.input_translation {
+            result.push_str(&format!("\t{} -> {}\n", key.serialize_to_str(ctx), value.serialize_to_str(ctx)));
+        }
+
+        result.push_str("}");
+        result
     }
 }
 
 /// Symbolic executor for transition systems
 pub struct SymbolicExecutor {
-    /// Deep copy of the transition system
     ts: TransitionSystem,
-    /// Current step
     current_step: usize,
-    /// All execution paths (breadth-first across steps)
     paths: Vec<ExecutionPath>,
-    /// Mapping from original state symbols to their types (width for bv)
     state_types: HashMap<ExprRef, Type>,
-    /// Mapping from original input symbols to their types
     input_types: HashMap<ExprRef, Type>,
-    /// All symbols used across all paths 
     all_symbols: HashSet<ExprRef>,
+    constraints: Vec<ExprRef>,
 }
 
 impl SymbolicExecutor {
-    /// Create a new symbolic executor from a transition system
-    /// Makes a deep copy of the transition system
     pub fn new(ts: &TransitionSystem) -> Self {
         SymbolicExecutor {
-            ts: ts.clone(), // Deep copy
+            ts: ts.clone(),
             current_step: 0,
             paths: Vec::new(),
             state_types: HashMap::new(),
             input_types: HashMap::new(),
             all_symbols: HashSet::new(),
+            constraints: Vec::new(),
         }
     }
 
-    /// Initialize the symbolic executor
     pub fn init(&mut self, ctx: &mut Context) {
-        // Collect state and input types
         for state in &self.ts.states {
             let tpe = state.symbol.get_type(ctx);
             self.state_types.insert(state.symbol, tpe);
-            self.all_symbols.insert(state.symbol);
         }
         for input in &self.ts.inputs {
             let tpe = input.get_type(ctx);
@@ -75,27 +81,28 @@ impl SymbolicExecutor {
         let mut initial_path = ExecutionPath::new();
 
         for state in &self.ts.states {
-            if let Some(init_expr) = state.init {
-                // If it has an initial value, put it directly in variable_definitions
-                initial_path.variable_definitions.insert(state.symbol, init_expr);
-            } else {
-                // No initial value - store the symbol itself in variable_definitions
-                initial_path.variable_definitions.insert(state.symbol, state.symbol);
-            }
+            // All states start as state_t0 symbols, regardless of init values.
+            // On the first step, states with init values will be set to their
+            // init value instead of stepping.
+            let name = ctx.get_symbol_name(state.symbol).unwrap_or("state");
+            let t0_name = format!("{}_t0", name);
+            let tpe = self.state_types[&state.symbol];
+            let t0_sym = match tpe {
+                Type::BV(width) => ctx.bv_symbol(&t0_name, width),
+                Type::Array(arr_type) => {
+                    ctx.array_symbol(&t0_name, arr_type.index_width, arr_type.data_width)
+                }
+            };
+            initial_path.state_translation.insert(state.symbol, t0_sym);
+            self.all_symbols.insert(t0_sym);
         }
 
-        // Add transition system constraints to initial path
-        // These will be inherited by all divergent paths
-        for &constraint in &self.ts.constraints {
-            let simplified = simplify_single_expression(ctx, constraint);
-            initial_path.constraints.push(simplified);
-        }
+        self.constraints = self.ts.constraints.clone();
 
         self.paths.push(initial_path);
         self.current_step = 0;
     }
 
-    /// Substitute all symbols in an expression using the translation map and variable definitions
     fn substitute_expr(
         &self,
         ctx: &mut Context,
@@ -103,14 +110,12 @@ impl SymbolicExecutor {
         path: &ExecutionPath,
     ) -> ExprRef {
         let translations = &path.input_translation;
-        let definitions = &path.variable_definitions;
+        let definitions = &path.state_translation;
         
         simple_transform_expr(ctx, expr, |_ctx, e, _children| {
-            // Check if this is a symbol we need to translate (inputs)
             if translations.contains_key(&e) {
                 Some(translations[&e])
             } else if definitions.contains_key(&e) {
-                // Check if this is a state variable in definitions
                 Some(definitions[&e])
             } else {
                 None 
@@ -118,7 +123,6 @@ impl SymbolicExecutor {
         })
     }
 
-    /// Check if an expression is an ITE and return its components
     fn get_ite_components(&self, ctx: &Context, expr: ExprRef) -> Option<(ExprRef, ExprRef, ExprRef)> {
         match &ctx[expr] {
             Expr::BVIte { cond, tru, fals } => Some((*cond, *tru, *fals)),
@@ -127,9 +131,6 @@ impl SymbolicExecutor {
         }
     }
 
-
-    /// Check if a condition is satisfiable given current path conditions
-    /// Returns: Some(true) if SAT, Some(false) if UNSAT, None if neither
     fn check_condition_sat<S: SolverContext>(
         &self,
         ctx: &mut Context,
@@ -144,21 +145,16 @@ impl SymbolicExecutor {
         for sym in &self.all_symbols {
             let _ = solver.declare_const(ctx, *sym);
         }
-
-        // Assert existing constraints
-        for (&sym, &value) in &path.variable_definitions {
-            let eq = ctx.equal(sym, value);
-            let _ = solver.assert(ctx, eq);
-        }
-        for &constraint in &path.constraints {
-            let _ = solver.assert(ctx, constraint);
-        }
+        
         for &pc in &path.path_conditions {
-            let _ = solver.assert(ctx, pc);
+            let substituted = self.substitute_expr(ctx, pc, path);
+            let simplified = simplify_single_expression(ctx, substituted);
+            let _ = solver.assert(ctx, simplified);
         }
 
-        // Assert the condition we're checking
-        let _ = solver.assert(ctx, condition);
+        let substituted_cond = self.substitute_expr(ctx, condition, path);
+        let simplified_cond = simplify_single_expression(ctx, substituted_cond);
+        let _ = solver.assert(ctx, simplified_cond);
 
         let result = match solver.check_sat() {
             Ok(CheckSatResponse::Sat) => Some(true),
@@ -170,64 +166,173 @@ impl SymbolicExecutor {
         result
     }
 
-    /// Process a single ITE expression with SAT-based pruning
-    /// Returns branches to explore: each branch is (value, optional condition to add)
-    fn process_ite_with_sat<S: SolverContext>(
+
+    fn prune_infeasible_paths<S: SolverContext>(
         &self,
         ctx: &mut Context,
         solver: &mut S,
-        path: &ExecutionPath,
-        cond: ExprRef,
-        tru: ExprRef,
-        fals: ExprRef,
-    ) -> Vec<(ExprRef, Option<ExprRef>)> {
-        let mut branches = Vec::new();
+        path_stack: Vec<ExecutionPath>,
+    ) -> Vec<ExecutionPath> {
 
-        // Check if path ∧ cond is SAT
-        let cond_sat = self.check_condition_sat(ctx, solver, path, cond);
-        
-        // Check if path ∧ ¬cond is SAT
-        let neg_cond = ctx.not(cond);
-        let neg_sat = self.check_condition_sat(ctx, solver, path, neg_cond);
+        let mut feasible_paths = Vec::new();
 
-        match (cond_sat, neg_sat) {
-            (Some(true), Some(true)) => {
-                // Both branches are feasible - cond can be true or false
-                // Must explore both paths WITH conditions added
-                branches.push((tru, Some(cond)));
-                branches.push((fals, Some(neg_cond)));
+        for path in path_stack {
+
+            if solver.push().is_err() {
+                // If push fails, conservatively keep the path
+                feasible_paths.push(path);
+                continue;
             }
-            (Some(true), Some(false)) => {
-                // cond is redundant - take true branch without adding condition
-                branches.push((tru, None));
+
+            for sym in &self.all_symbols {
+                let _ = solver.declare_const(ctx, *sym);
             }
-            (Some(false), Some(true)) => {
-                // not cond is redundant - take false branch without adding condition
-                branches.push((fals, None));
+
+            let constraints = self.constraints.clone();
+            for &constraint in &constraints {
+                let substituted = self.substitute_expr(ctx, constraint, &path);
+                let simplified = simplify_single_expression(ctx, substituted);
+                let _ = solver.assert(ctx, simplified);
             }
-            (Some(false), Some(false)) => {
-                // Both UNSAT - path is infeasible
+
+            for &pc in &path.path_conditions {
+                let substituted = self.substitute_expr(ctx, pc, &path);
+                let simplified = simplify_single_expression(ctx, substituted);
+                let _ = solver.assert(ctx, simplified);
             }
-            _ => {
-                // Unknown - conservatively explore both
-                branches.push((tru, Some(cond)));
-                branches.push((fals, Some(neg_cond)));
+
+            let result = solver.check_sat();
+            let is_sat = match &result {
+                Ok(CheckSatResponse::Sat) => true,
+                Ok(CheckSatResponse::Unsat) => false,
+                _ => panic!("got unexpected SAT response (not SAT or UNSAT)"),
+            };
+            let _ = solver.pop();
+
+            if is_sat {
+                feasible_paths.push(path);
             }
         }
 
-        branches
+        feasible_paths
     }
 
-    /// Execute one step of symbolic execution using DFS
-    /// Processes all current paths and creates new paths for the next timestep
+
+    fn explore_paths<S: SolverContext>(
+        &self,
+        ctx: &mut Context,
+        solver: &mut S,
+        path_stack: &mut Vec<ExecutionPath>,
+        state_symbol: ExprRef,
+        next_expr: ExprRef,
+    ) {
+        let mut i = 0;
+        while i < path_stack.len() {
+
+            let substituted = self.substitute_expr(ctx, next_expr, &path_stack[i]);
+            let simplified = simplify_single_expression(ctx, substituted);
+            let new_state = self.resolve_ite(ctx, solver, i, path_stack, simplified);
+            path_stack[i].state_translation.insert(state_symbol, new_state);
+
+            i += 1;
+        }
+    }
+
+    /// Resolves all ITEs by assuming the condition is true and adding the false condition 
+    /// To a growing path stack. Only added as follows:
+    ///
+    /// - If only one branch is feasible, follow that branch (no extra path condition).
+    /// - If both branches are feasible, fork: the current path takes the true branch
+    ///   (with `cond` added to its path conditions) and a cloned path is returned for
+    ///   later re-evaluation by `explore_paths` (with `¬cond` in its conditions).
+    /// - If neither branch is feasible, the path is infeasible (panic).
+    fn resolve_ite<S: SolverContext>(
+        &self,
+        ctx: &mut Context,
+        solver: &mut S,
+        i: usize,
+        path_stack: &mut Vec<ExecutionPath>,
+        expr: ExprRef,
+    ) -> ExprRef {
+        if let Some((cond, tru, fals)) = self.get_ite_components(ctx, expr) {
+            // Check feasibility of both branches under the current path conditions
+            let cond_sat = self.check_condition_sat(ctx, solver, &path_stack[i], cond);
+            let neg_cond = ctx.not(cond);
+            let neg_sat = self.check_condition_sat(ctx, solver, &path_stack[i], neg_cond);
+
+            match (cond_sat, neg_sat) {
+                (Some(true), Some(false)) => {
+                    // Only the true branch is feasible
+                    self.resolve_ite(ctx, solver, i, path_stack, tru)
+                }
+                (Some(false), Some(true)) => {
+                    // Only the false branch is feasible
+                    self.resolve_ite(ctx, solver, i, path_stack, fals)
+                }
+                (Some(true), Some(true)) => {
+                    // Both branches are feasible — fork the path
+                    let mut forked_path = path_stack[i].clone();
+                    path_stack[i].path_conditions.push(cond);
+                    forked_path.path_conditions.push(neg_cond);
+                    path_stack.push(forked_path);
+                    self.resolve_ite(ctx, solver, i, path_stack, tru)
+                }
+                (Some(false), Some(false)) => {
+                    panic!("Infeasible path: both branches of ITE are UNSAT");
+                }
+                _ => {
+                    panic!("SMT solver returned an unexpected result while resolving ITE");
+                }
+            }
+        } else {
+            // Not an ITE — collect children, resolve each, and rebuild if any changed
+            let mut children = Vec::new();
+            ctx[expr].for_each_child(|c| children.push(*c));
+
+            if children.is_empty() {
+                return expr;
+            }
+
+            let mut resolved_children = Vec::new();
+            let mut any_changed = false;
+            for &child in &children {
+                let resolved = self.resolve_ite(ctx, solver, i, path_stack, child);
+                if resolved != child {
+                    any_changed = true;
+                }
+                resolved_children.push(resolved);
+            }
+
+            if !any_changed {
+                return expr;
+            }
+
+            // Build a mapping from original children to resolved children
+            let child_map: HashMap<ExprRef, ExprRef> = children
+                .iter()
+                .zip(resolved_children.iter())
+                .map(|(&old, &new)| (old, new))
+                .collect();
+
+            // Rebuild the expression with resolved children
+            simple_transform_expr(ctx, expr, |_ctx, e, _| {
+                child_map.get(&e).copied()
+            })
+        }
+    }
+
+
+    /// On the first step (step 0 -> 1), states with init values are set to
+    /// their init value instead of evaluating the next-state function.
+    /// States without init values step normally even on the first step.
     pub fn step<S: SolverContext>(&mut self, ctx: &mut Context, solver: &mut S) {
         self.current_step += 1;
         let next_step = self.current_step;
+        let is_first_step = next_step == 1;
         
         let mut new_paths = Vec::new();
         let states: Vec<_> = self.ts.states.clone();
 
-        // Create new timestamped input symbols once per step and add to global symbol set
         let input_timestamp = next_step - 1;
         let mut timestamped_inputs = HashMap::new();
         for input in &self.ts.inputs {
@@ -247,112 +352,54 @@ impl SymbolicExecutor {
         for path in &self.paths {
             let mut base_path = ExecutionPath::new();
             base_path.path_conditions = path.path_conditions.clone();
-            base_path.constraints = path.constraints.clone();
-
-            // Use the pre-created timestamped inputs
             base_path.input_translation = timestamped_inputs.clone();
+            base_path.state_translation = path.state_translation.clone();
 
-            // DFS exploration of state transitions
-            // Stack contains: (current_path, state_index)
-            let mut stack: Vec<(ExecutionPath, usize)> = vec![(base_path.clone(), 0)];
+            let mut path_stack = vec![base_path];
 
-            let mut combined_path_for_next = ExecutionPath::new();
-            combined_path_for_next.variable_definitions = path.variable_definitions.clone();
-            combined_path_for_next.input_translation = base_path.input_translation.clone();
-
-            while let Some((current_path, state_idx)) = stack.pop() {
-                if state_idx >= states.len() {
-                    // All states processed
-                    new_paths.push(current_path);
-                    continue;
+            if is_first_step {
+                for state in &states {
+                    if let Some(init_expr) = state.init {
+                        for p in path_stack.iter_mut() {
+                            p.state_translation.insert(state.symbol, init_expr);
+                        }
+                    } else if let Some(next_expr) = state.next {
+                        self.explore_paths(ctx, solver, &mut path_stack, state.symbol, next_expr);
+                    }
                 }
-
-                let state = &states[state_idx];
-                let next_expr = if let Some(next) = state.next {
-                    // Substitute using the combined path 
-                    self.substitute_expr(ctx, next, &combined_path_for_next)
-                } else {
-                    // No next expression - state stays the same
-                    path.variable_definitions[&state.symbol]
-                };
-
-                // Process the expression, handling nested ITEs with DFS
-                self.process_state_transition_dfs(
-                    ctx,
-                    solver,
-                    &mut stack,
-                    current_path,
-                    state_idx,
-                    state.symbol,
-                    next_expr,
-                );
+            } else {
+                for state in &states {
+                    if let Some(next_expr) = state.next {
+                        self.explore_paths(ctx, solver, &mut path_stack, state.symbol, next_expr);
+                    }
+                }
             }
+
+            let feasible_paths = self.prune_infeasible_paths(ctx, solver, path_stack);
+
+            new_paths.extend(feasible_paths);
         }
 
         self.paths = new_paths;
     }
 
-    /// Process a state transition expression using DFS, handling nested ITEs
-    fn process_state_transition_dfs<S: SolverContext>(
-        &self,
-        ctx: &mut Context,
-        solver: &mut S,
-        stack: &mut Vec<(ExecutionPath, usize)>,
-        path: ExecutionPath,
-        state_idx: usize,
-        state_symbol: ExprRef,
-        expr: ExprRef,
-    ) {
-        // Inner stack for processing nested ITEs within this state's expression
-        let mut expr_stack: Vec<(ExecutionPath, ExprRef)> = vec![(path, expr)];
 
-        while let Some((mut current_path, current_expr)) = expr_stack.pop() {
-            if let Some((cond, tru, fals)) = self.get_ite_components(ctx, current_expr) {
-                // This is an ITE - check SAT and determine branches
-                let branches = self.process_ite_with_sat(ctx, solver, &current_path, cond, tru, fals);
-
-                for (value, opt_condition) in branches {
-                    let mut branch_path = current_path.clone();
-                    
-                    if let Some(condition) = opt_condition {
-                        branch_path.path_conditions.push(condition);
-                    }
-
-                    expr_stack.push((branch_path, value));
-                }
-            } else {
-                // this is a final value for this state
-                current_path.variable_definitions.insert(state_symbol, current_expr);
-                stack.push((current_path, state_idx + 1));
-            }
-        }
-    }
-
-    /// Get the current step number
-    pub fn current_step(&self) -> usize {
-        self.current_step
-    }
-
-    /// Get all current paths
-    pub fn paths(&self) -> &[ExecutionPath] {
-        &self.paths
-    }
-
-    /// Get the transition system
-    pub fn transition_system(&self) -> &TransitionSystem {
-        &self.ts
-    }
-
-    /// Print the current state of symbolic execution
     pub fn print_step(&self, ctx: &mut Context) {
         println!("Step {}:", self.current_step);
+
+        println!("  All symbols:");
+        for sym in &self.all_symbols {
+            let name = ctx.get_symbol_name(*sym).unwrap_or("unknown");
+            println!("    {}", name);
+        }
+        println!();
 
         for (path_idx, path) in self.paths.iter().enumerate() {
             println!("  Path_condition {}:", path_idx + 1); 
 
             println!("    Variables:");
             for state in &self.ts.states {
-                if let Some(&value) = path.variable_definitions.get(&state.symbol) {
+                if let Some(&value) = path.state_translation.get(&state.symbol) {
                     let sym_name = ctx.get_symbol_name(state.symbol).unwrap_or("unknown").to_string();
                     let simplified = simplify_single_expression(ctx, value);
                     println!("      {} = {}", sym_name, simplified.serialize_to_str(ctx));
@@ -375,6 +422,17 @@ impl SymbolicExecutor {
                 println!("      Constraint {}: {}", constraint_idx, simplified.serialize_to_str(ctx));
                 constraint_idx += 1;
             }
+            
+            println!("    System Constraints:");
+            let mut sys_constraint_idx = 0;
+            let constraints = self.constraints.clone();
+            for &constraint in &constraints {
+                let substituted = self.substitute_expr(ctx, constraint, &path);
+                let simplified = simplify_single_expression(ctx, substituted);
+                println!("      Constraint {}: {}", sys_constraint_idx, simplified.serialize_to_str(ctx));
+                sys_constraint_idx += 1;
+            }
+            
             
             println!();
         }
