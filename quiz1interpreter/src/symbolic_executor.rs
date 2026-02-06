@@ -272,10 +272,6 @@ impl SymbolicExecutor {
         }
     }
 
-
-    /// On the first step (step 0 -> 1), states with init values are set to
-    /// their init value instead of evaluating the next-state function.
-    /// States without init values step normally even on the first step.
     pub fn step<S: SolverContext>(&mut self, ctx: &mut Context, solver: &mut S) {
         self.current_step += 1;
         let next_step = self.current_step;
@@ -322,7 +318,49 @@ impl SymbolicExecutor {
             new_paths.extend(path_stack);
         }
 
-        self.paths = new_paths;
+
+        let mut merged_paths: Vec<ExecutionPath> = Vec::new();
+
+        for path in new_paths {
+            let mut found_match = false;
+
+            for existing in merged_paths.iter_mut() {
+                let states_match = existing.state_translation.len() == path.state_translation.len()
+                    && existing.state_translation.iter().all(|(k, v)| {
+                        path.state_translation.get(k) == Some(v)
+                    });
+
+                if states_match {
+                    let cond_existing = if existing.path_conditions.is_empty() {
+                        ctx.get_true()
+                    } else {
+                        existing.path_conditions.iter().copied()
+                            .reduce(|a, b| ctx.and(a, b))
+                            .unwrap()
+                    };
+
+                    let cond_new = if path.path_conditions.is_empty() {
+                        ctx.get_true()
+                    } else {
+                        path.path_conditions.iter().copied()
+                            .reduce(|a, b| ctx.and(a, b))
+                            .unwrap()
+                    };
+
+                    let merged_cond = ctx.or(cond_existing, cond_new);
+                    existing.path_conditions = vec![merged_cond];
+
+                    found_match = true;
+                    break;
+                }
+            }
+
+            if !found_match {
+                merged_paths.push(path);
+            }
+        }
+
+        self.paths = merged_paths;
     }
 
 
