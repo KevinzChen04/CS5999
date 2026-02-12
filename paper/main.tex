@@ -1,0 +1,48 @@
+\documentclass[11pt]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[margin=1in]{geometry}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{amsmath, amssymb}
+
+\bibliographystyle{plain}
+
+
+\title{TODO Add a name}
+\author{Kevin Chen}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\section{Introduction}
+
+\section{Symbolic Execution}
+
+Symbolic execution is a way of executing a program abstractly, such that on abstract execution covers multiple possible inputs of the program that share a particular execution path through the code \cite{aldrich2018symbolic}. Each input of symbolicly executed code is represented as a symbol rather than assigning it a concrete value. When the value is referenced such as for an if statement, the execution path branches, where one path the symbolic value is evaluated as true while the other path the symboilic value is evaluated as false.
+
+One of the key uses for symboli execution is in testing. Most unit tests, require the programmer to hardcode in values to test, resulting in various unit tests to cover all branches the code can tranverse. On the other hand, a symbolic execution would execute simutaneously on a family of inputs. Consider the following example:
+
+\begin{algorithm}
+    \caption{Add and Check Even}
+    \begin{algorithmic}[1]
+    \Require $x, y \in \mathbb{Z}$
+    \State $a \gets x + y$
+    \If{$a \bmod 2 = 0$}
+        \State \Return error ``$a$ is even''
+    \Else
+        \State \Return $a$
+    \EndIf
+    \end{algorithmic}
+\end{algorithm}
+    
+
+
+\section{Conclusion}
+
+\bibliography{references}
+
+\end{document}
