@@ -29,7 +29,7 @@ TODO insert introduction
 
 Symbolic execution is a way of executing a program abstractly, such that on abstract execution covers multiple possible inputs of the program that share a particular execution path through the code \cite{aldrich2018symbolic}. Each input of symbolicly executed code is represented as a symbol rather than assigning it a concrete value. When the value is referenced such as for an if statement, the execution path branches, where one path the symbolic value is evaluated as true while the other path the symboilic value is evaluated as false.
 
-One of the key uses for symboli execution is in testing. Most unit tests, require the programmer to hardcode in values to test, resulting in various unit tests to cover all branches the code can tranverse. On the other hand, a symbolic execution would execute simutaneously on a family of inputs. Consider the following example:
+One of the key uses for symbolic execution is in testing. Most unit tests, require the programmer to hardcode in values to test, resulting in various unit tests to cover all branches the code can tranverse. On the other hand, a symbolic execution would execute simutaneously on a family of inputs. Consider the following example:
 
 \begin{algorithm}
     \caption{Algorithm 1}
@@ -90,7 +90,7 @@ In this example, we see that the inputs values start symbolic as symbols which h
     \label{fig:execution-tree}
 \end{figure}
 
-In each paths, we accumulate the different path conditions until we either reach the end (return statement) or a failure (error). In this case, we find that there exists a set of inputs (when $x_0+y_0 \bmod 2 = 0$), which causes an error. Prior to running this program with symbolic execution, one can add constraints to the path. Below, an example where we start with a given constraint that $x_0+y_0=1$:
+In each paths, we accumulate the different path conditions until we either reach the end (return statement) or a failure (error). In this case, we find that there exists a set of inputs (when $x_0+y_0 \bmod 2 = 0$), which causes an error. Now imagine a different example; using the same coding example, but with a twist. Prior to running this program with symbolic execution, one can add constraints to the path. Below, an example where we start with a given constraint that $x_0+y_0=1$:
 
 \begin{figure}[H]
     \centering
@@ -111,6 +111,89 @@ In each paths, we accumulate the different path conditions until we either reach
 \end{figure}
 
 With the constraint, the path condition which leads to the error is contradictory. This illustrates that the path is impossible. With this constraint, we see that no path leads to any errors. In industry, programmers, can create tests with given preconditions (constraints) and run until the program terminates. Instead of throwing an error, we can use assertion statements as post-conditions. If it terminates without an error, the program is robust across all set of inputs. Otherwise, a symbolicly executed program will return a concrete set of conditions which will give an error or violate a post-condtiion.
+
+\subsection{While loops}
+
+To represent a while loop in symbolic execution, we unroll it into a recursive function with no loops. Take the following code for instance:
+
+\begin{algorithm}
+    \caption{Count Number of 1's in a Bit Vector}
+    \begin{algorithmic}[1]
+    \Require $v$ is a bit vector of length $n$
+    \State $count \gets 0$
+    \State $i \gets 0$
+    \While{$i < n$}
+        \If{$v[i] == 1$}
+            \State $count \gets count + 1$
+        \EndIf
+        \State $i \gets i + 1$
+    \EndWhile
+    \State \Return $count$
+    \end{algorithmic}
+\end{algorithm}
+
+We can rewrite it as a recursive function: 
+
+\begin{algorithm}
+    \caption{Recursively Count Number of 1's in a Bit Vector}
+    \label{alg:recursive-count-ones}
+    \begin{algorithmic}[1]
+    \Require $v$ is a bit vector of length $n$
+    \Function{count\_ones}{$v, i, n$}
+        \If{$i == n$}
+            \State \Return $0$
+        \ElsIf{$v[i] == 1$}
+            \State \Return $1 +$ \Call{count\_ones}{$v, i+1, n$}
+        \Else
+            \State \Return \Call{count\_ones}{$v, i+1, n$}
+        \EndIf
+    \EndFunction
+    \State \Return \Call{count\_ones}{$v, 0, n$}
+    \end{algorithmic}
+\end{algorithm}
+
+Now that we have rewritten the while loop as if statements, we simply create a new branch for every if statement. In practice, this may lead to state explosion, resulting in thousands of branches in a just a few iterations. Programmers either set a recursion limit, terminating the branch which gets stuck, or find a different way to represent the while loop, using the loop invariant. Below is a tree of the branching paths created from a symbolic execution of Algorithm~\ref{alg:recursive-count-ones}. 
+
+\begin{figure}[H]
+    \centering
+    \begin{tikzpicture}[
+        level 1/.style={sibling distance=4cm, level distance=2cm},
+        level 2/.style={sibling distance=7cm, level distance=2cm},
+        level 3/.style={sibling distance=3cm, level distance=2cm},
+        every node/.style={draw, rounded corners, align=center, minimum width=2cm},
+        edge from parent/.style={draw, -latex}
+      ]
+      
+      \node {$i == n$?}
+          child { node {Return 0}
+              edge from parent node[left, draw=none] {Return 0}
+          }
+          child { node {$v[i] == 1$?}
+              child { node {$i == n$?}
+                  child { node {Return 0}
+                      edge from parent node[left, draw=none, font=\scriptsize] {$1 + 0$}
+                  }
+                  child { node {$v[i] == 1$?}
+                      edge from parent node[right, draw=none, font=\scriptsize] {$1 +$ count\_ones($v, i\!+\!1, n$)}
+                  }
+                  edge from parent node[left, draw=none] {$1 +$ count\_ones($v, i\!+\!1, n$)}
+              }
+              child { node {$i == n$?}
+                  child { node {Return 0}
+                      edge from parent node[left, draw=none, font=\scriptsize] {Return 0}
+                  }
+                  child { node {$v[i] == 1$?}
+                      edge from parent node[right, draw=none, font=\scriptsize] {count\_ones($v, i\!+\!1, n$)}
+                  }
+                  edge from parent node[right, draw=none] {count\_ones($v, i\!+\!1, n$)}
+              }
+              edge from parent node[right, draw=none] {check $v[i]$}
+          };
+      
+      \end{tikzpicture}
+    \caption{Symbolic execution tree for the recursive count\_ones algorithm showing branching at each condition}
+    \label{fig:recursive-execution-tree}
+\end{figure}
 
 \section{My Program}
 
