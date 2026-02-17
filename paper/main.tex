@@ -33,6 +33,7 @@ One of the key uses for symbolic execution is in testing. Most unit tests, requi
 
 \begin{algorithm}
     \caption{Algorithm 1}
+    \label{alg:simple-example}
     \begin{algorithmic}[1]
     \Require $x, y \in \mathbb{Z}$
     \State $a \gets x + y$
@@ -118,6 +119,7 @@ To represent a while loop in symbolic execution, we unroll it into a recursive f
 
 \begin{algorithm}
     \caption{Count Number of 1's in a Bit Vector}
+    \label{alg:count-ones-while}
     \begin{algorithmic}[1]
     \Require $v$ is a bit vector of length $n$
     \State $count \gets 0$
@@ -195,12 +197,32 @@ Now that we have rewritten the while loop as if statements, we simply create a n
     \label{fig:recursive-execution-tree}
 \end{figure}
 
-\section{My Program}
-
-\subsection{Execution Path}
+\section{Hardware Language}
 
 
+\section{Patronus}
 
+\subsection{Expressions}
+
+Patronus\cite{cucapra2024patronus} represents expressions under the class \textit{Expr} and $\textit{ExprRef}$. Each expression is an object which contains the type of expression and a list of \textit{ExprRef} to other expressions. For example, the expression $if (x==4, y+=3, z+=4)$ can be represented as $ite(\textit{ExprRef}[1], \textit{ExprRef}[2], \textit{ExprRef}[3])$. The expressions are stored all in an Context.
+
+\section{Implementation}
+
+\subsection{Symbolic Execution}
+
+One of the key challenges of implementing symbolic execution is being able to distinguish whether or not a path is feasible or not. Consider the execution from Figure~\ref{fig:symbolic-trace-with-constraint} row 3. The question are we suppose to tell that this path represents is infeasible?
+
+As always in computer science, one of the best ways to model something is to make it someone else's problem; take an answer to an existing hard solution and leverage it to solve your problem. Here, we leverage a SAT solver to answer these ambiguous questions for us. Now, all we need to do is translate each branching statement into a serious of binary equations.
+
+We represent integers as bit-vectors of their binary representation. A standard 32-bit integer would instead be represented as size 32 vector of booleans. 
+
+We represent the state of an symbolic execution with the following tripe: $(P, M, C)$, where $P$ holds the path conditions, $M$ is the mapping which translates variables to symbols, and $C$ is the current command we are processing. Suppose that the command we are trying to process is an if statement with the form $C(c, t, f)$, where $c$ is the condition, $t$ is the return value if the condition is true, and false being the return value if the condition is false. To update the state, we run the following queries in the SMT Solver:
+\begin{enumerate}
+    \item{$P\land c = \textit{SAT} \land P\land \lnot c = \textit{SAT}$}: The SMT solver says that both paths are feasible. In this case, we create two branching executions one with $P'=P\land c$ and one with $P'=P\land \lnot c$. 
+    \item {$P\land c = \textit{SAT} \land P\land \lnot c = \textit{UNSAT}$}: The SMT solver says that the path such that $\lnot c$ is impossible. This means that given the information of $P$, $\lnot c$ is infeasible. As such, we do not need to add $\lnot c$ into the path, as the information is already recorded in the path. You can think of this as a node with one branch. It has no other choice so no branching executions are created. Consider $P=(x==10)\land (y==11), c=(x+y>12)$. There is no need to add $c$ to the execution path because the value is already included in $P$. 
+    \item {$P\land c = \textit{UNSAT} \land P\land \lnot c = \textit{SAT}$}: She SMT solver says that the path such that $c$ is impossible. Similar to the previous case, we do not need to add $c$ onto the path as the information for deducing $\lnot c$ is already included in $P$. 
+    \item {$P\land c = \textit{UNSAT} \land P\land \lnot c = \textit{UNSAT}$}: The result states that regardless of $c$ the execution is infeasible. This must mean that $P$ is infeasible, which means the constraints were infeasible. 
+\end{enumerate} 
 
 \section{Conclusion}
 
