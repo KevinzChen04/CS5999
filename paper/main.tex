@@ -224,6 +224,84 @@ We represent the state of an symbolic execution with the following tripe: $(P, M
     \item {$P\land c = \textit{UNSAT} \land P\land \lnot c = \textit{UNSAT}$}: The result states that regardless of $c$ the execution is infeasible. This must mean that $P$ is infeasible, which means the constraints were infeasible. 
 \end{enumerate} 
 
+\subsection{Initialize}
+
+You start in the initiation step. Each state variable will start with an symbolic value. However, if it has an initial value, the state variable will be assigned to that instead. For simplicity, values assigned at each timestep will have a timestep added as part of its symbol. This is to distinguish between symbols added and important for identifying different symbols for the input.
+
+\subsection{Simplification}
+
+The goal of simplification is to have values as simplist terms. This means that each expression must contain basic terms, such as numbers or symbols, things that cannot be further simplified. 
+
+Assume you have all the basic rules for simplification. One example is if you add two integers, the result should just be the sum of the integers. Another is if you have an if statement and the condition is true, then it should simplify to just the true branch. 
+
+To simplify expressions and expression references, we need to start by simplifying the inner most layer. This is implemented with a stack. Each child of an expression gets added to a stack and the last children added is popped and simplified. Table~\ref{fig:btor-simplify} traces this algorithm on the expression $\mathit{If}(\mathit{true}, \mathit{If}(\mathit{add}(0,1), 4, 5), -1)$: the first column is the step (number of pops), the second is the current result overall (the full expression with all completed simplifications applied so far), the third is the current simplification target (the expression just popped), and the fourth is the stack (top to bottom) after pushing that target's children, if any. The expression simplifies to $4$: $-1$, $4$, and $5$ do not simplify; $\mathit{add}(0,1)$ simplifies to $1$; $\mathit{If}(1, 4, 5)$ simplifies to $4$ (condition is true); $\mathit{If}(\mathit{true}, 4, -1)$ simplifies to $4$.
+
+\begin{figure}[H]
+    \centering
+    \begin{tabular}{|c|l|l|l|}
+        \hline
+        \textbf{Step} & \textbf{Current result overall} & \textbf{Current simplification target} & \textbf{Stack} \\
+        \hline
+        0 & $\mathit{If}(\mathit{true}, \mathit{If}(\mathit{add}(0,1), 4, 5), -1)$ & $\mathit{If}(\mathit{true}, \mathit{If}(\mathit{add}(0,1), 4, 5), -1) \to ?$ & $\mathit{true},\ \mathit{If}(\mathit{add}(0,1), 4, 5),\ -1$ \\
+        \hline
+        1 & $\mathit{If}(\mathit{true}, \mathit{If}(\mathit{add}(0,1), 4, 5), -1)$ & $-1 \to -1$ & $\mathit{true},\ \mathit{If}(\mathit{add}(0,1), 4, 5)$ \\
+        \hline
+        2 & $\mathit{If}(\mathit{true}, \mathit{If}(\mathit{add}(0,1), 4, 5), -1)$ & $\mathit{If}(\mathit{add}(0,1), 4, 5) \to ?$ & $\mathit{true},\ \mathit{add}(0,1),\ 4,\ 5$ \\
+        \hline
+        3 & $\mathit{If}(\mathit{true}, \mathit{If}(\mathit{add}(0,1), 4, 5), -1)$ & $5 \to 5$ & $\mathit{true},\ \mathit{add}(0,1),\ 4$ \\
+        \hline
+        4 & $\mathit{If}(\mathit{true}, \mathit{If}(\mathit{add}(0,1), 4, 5), -1)$ & $4 \to 4$ & $\mathit{true},\ \mathit{add}(0,1)$ \\
+        \hline
+        5 & $\mathit{If}(\mathit{true}, \mathit{If}(1, 4, 5), -1)$ & $\mathit{add}(0, 1) \to 1$ & $\mathit{true},\ \mathit{If}(1, 4, 5)$ \\
+        \hline
+        6 & $\mathit{If}(\mathit{true}, 4, -1)$ & $\mathit{If}(1, 4, 5) \to 4$ & $\mathit{true}$ \\
+        \hline
+        7 & $4$ & $\mathit{true} \to \mathit{true}$ & $\emptyset$ \\
+        \hline
+    \end{tabular}
+    \caption{Stack-based simplification trace for $\mathit{If}(\mathit{true}, \mathit{If}(\mathit{add}(0,1), 4, 5), -1)$. At each step the target is popped and its children (if any) are pushed. $-1$, $4$, $5$, $0$, $1$, and $\mathit{true}$ do not simplify; $\mathit{add}(0,1) \to 1$, then $\mathit{If}(1, 4, 5) \to 4$, then $\mathit{If}(\mathit{true}, 4, -1) \to 4$. Result: $4$.}
+    \label{fig:btor-simplify}
+\end{figure}
+
+\subsection{Finding nested if-statements}
+
+Using the idea for simplification, the same method can be used to traverse through nested if-statement. Start by implementing a stack which holds all the expressions, a stack which holds all the traversed paths, and a map which holds the position of each expression reference. For each expression, add each child to the mapping, and then explore each children. If any of the children are an ITE expression, we should simplify the path to either the true or false expression and add this to the path stack. Then, with the assumption that the ite is true or false, we can use simplification to simplify the expression and add it to the expression stack. Do this for each path as well and eventually we will have a list of paths which represent all feasible combinations of paths and, for each path, the new states. 
+
+Consider the expression $\mathit{add}(\mathit{ite}(x, 1, 2),\; \mathit{ite}(y, 2, 3))$ where $x$ and $y$ are unconstrained symbolic booleans. There are two nested ITE sub-expressions, one inside each argument of $\mathit{add}$, producing four feasible execution paths. Figure~\ref{fig:nested-ite-tree} shows the resulting path-exploration tree.
+
+\begin{figure}[H]
+    \centering
+    \begin{tikzpicture}[
+        level 1/.style={sibling distance=8.5cm, level distance=2.8cm},
+        level 2/.style={sibling distance=4.2cm, level distance=2.8cm},
+        every node/.style={draw, rounded corners, align=center, font=\small},
+        edge from parent/.style={draw, -latex}
+    ]
+    \node {resolve $\mathit{ite}(x,1,2)$}
+        child { node {resolve $\mathit{ite}(y,2,3)$}
+            child { node {$\mathit{add}(1,2)=3$\\[2pt]$P:\; x \land y$}
+                edge from parent node[left, draw=none] {$y$}
+            }
+            child { node {$\mathit{add}(1,3)=4$\\[2pt]$P:\; x \land \lnot y$}
+                edge from parent node[right, draw=none] {$\lnot y$}
+            }
+            edge from parent node[left, draw=none] {$x \;\Rightarrow\; 1$}
+        }
+        child { node {resolve $\mathit{ite}(y,2,3)$}
+            child { node {$\mathit{add}(2,2)=4$\\[2pt]$P:\; \lnot x \land y$}
+                edge from parent node[left, draw=none] {$y$}
+            }
+            child { node {$\mathit{add}(2,3)=5$\\[2pt]$P:\; \lnot x \land \lnot y$}
+                edge from parent node[right, draw=none] {$\lnot y$}
+            }
+            edge from parent node[right, draw=none] {$\lnot x \;\Rightarrow\; 2$}
+        };
+    \end{tikzpicture}
+    \caption{Path-exploration tree for $\mathit{add}(\mathit{ite}(x,1,2),\mathit{ite}(y,2,3))$. Each internal node shows an ITE being resolved; edges are labelled with the branch condition and its concrete value. Leaves show the fully resolved result and the accumulated path conditions $P$.}
+    \label{fig:nested-ite-tree}
+\end{figure}
+
+
 \section{Conclusion}
 
 \bibliography{references}
