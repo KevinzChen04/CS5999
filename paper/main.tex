@@ -263,9 +263,6 @@ and passes this purely boolean clause to the SAT solver.
 Patronus\cite{cucapra2024patronus} represents expressions under the class \textit{Expr} and $\textit{ExprRef}$. Each expression is an object which contains the type of expression and a list of \textit{ExprRef} to other expressions. For example, the expression $if (x==4, y+=3, z+=4)$ can be represented as $ite(\textit{ExprRef}[1], \textit{ExprRef}[2], \textit{ExprRef}[3])$. The expressions are stored all in an Context.
 
 \section{Implementation}
-
-\subsection{Symbolic Execution}
-
 \subsection{Initialize}
 
 In the initiation, each state variable will starts with an symbolic value. However, if the state variable has an initial value, it will be assigned to that instead. For simplicity, values assigned at each timestep will have a timestep added as part of its symbol. This is to distinguish between symbols added and important for identifying different symbols for the input.
