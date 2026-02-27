@@ -197,10 +197,66 @@ Now that we have rewritten the while loop as if statements, we simply create a n
     \label{fig:recursive-execution-tree}
 \end{figure}
 
-\section{Hardware Language}
-
-
 \section{Patronus}
+
+\subsection{BTOR2}
+
+BTOR2 is a word-level model checking format for capturing models of hardware and potentially software in a bit-precise manner. The exact architecture in which it is defined can be found at \cite{niemetz2018btor2}.
+
+For the purposes of this project, we simplify the language into a transition system which holds state variables, inputs, constraints, and bad states. To set up the system, the state variables start by holding some initial value and transition function. To take a step in the system, translate all the state variables through their existing transition functions. Inputs are free, nondeterministic values chosen at each transition, so long as they satisfy all constraints. At the end of the step, check that the bad state predicate is not satisfied.
+
+The components of the transition system map directly to BTOR2 keywords: \texttt{state} (with \texttt{init} and \texttt{next}) for state variables, \texttt{input} for free inputs, \texttt{constraint} for invariant assumptions on inputs, and \texttt{bad} for the safety violation predicate. Algorithm~\ref{alg:btor2-bmc} formalizes this execution model; Table~\ref{fig:btor2-trace} traces a concrete two-step run that witnesses a bad state.
+
+\begin{algorithm}
+    \caption{BTOR2 Bounded Model Checking}
+    \label{alg:btor2-bmc}
+    \begin{algorithmic}[1]
+    \Require Transition system $(\mathcal{S},\,\mathcal{I},\,\mathit{init},\,\mathit{next},\,\mathcal{C},\,\mathcal{B})$; bound $K$
+    \State \textbf{Init:} for each $s \in \mathcal{S}$, set $s \gets \mathit{init}(s)$
+    \For{$k = 0, 1, \ldots, K$}
+        \If{$\mathcal{B}(\text{state})$}
+            \State \Return \textsc{Unsafe} \Comment{bad state reached at step $k$}
+        \EndIf
+        \State Choose values for each $i \in \mathcal{I}$ satisfying every $c \in \mathcal{C}$
+        \For{each $s \in \mathcal{S}$}
+            \State $s \gets \mathit{next}(s,\,\mathcal{I})$
+        \EndFor
+    \EndFor
+    \State \Return \textsc{Unknown}
+    \end{algorithmic}
+\end{algorithm}
+
+Consider a system with one state variable $s$ (initialized to $0$, $\mathit{next}(s) = s + \mathit{inp}$), one free input $\mathit{inp}$ constrained by $\mathit{inp} \geq 1$, and bad state $\mathcal{B} \equiv s \geq 3$.
+
+\begin{figure}[H]
+    \centering
+    \begin{tabular}{|c|c|c|c|c|}
+        \hline
+        \textbf{Step} & \textbf{State ($s$)} & \textbf{Bad? ($s \geq 3$)} & \textbf{Input ($\mathit{inp}$)} & \textbf{Next State ($s'$)} \\
+        \hline
+        Init & $0$ & false & $1$ & $1$ \\
+        \hline
+        $1$  & $1$ & false & $2$ & $3$ \\
+        \hline
+        $2$  & $3$ & \textbf{true} & $-$ & $-$ \\
+        \hline
+    \end{tabular}
+    \caption{Two-step BTOR2 execution trace. State $s$ is initialized to $0$; each step applies a chosen input (constrained to $\geq 1$) and updates $s$ via $\mathit{next}$. The bad predicate $s \geq 3$ is first satisfied at step $2$, witnessing the safety violation.}
+    \label{fig:btor2-trace}
+\end{figure}
+
+\subsection{SMT Solver}
+
+One of the key challenges of implementing symbolic execution is being able to distinguish whether or not a path is feasible or not. How should a symbolic executor tell whether or not a path is feasible such as in Figure~\ref{fig:symbolic-trace-with-constraint} row 4 or infeasible, like in Figure~\ref{fig:symbolic-trace-with-constraint} row 3.
+
+As always in computer science, one of the best ways to model something is to make it someone else's problem: take an existing solution to a hard problem and leverage it to solve your own. Here, we leverage a SAT solver to determine path feasibility. The remaining challenge is translating each branching condition into a series of boolean equations. This is the role of an SMT (Satisfiability Modulo Theories) solver, which lifts raw SAT solving to richer data types. For example, integers are modeled as fixed-width bit-vectors; a standard 32-bit integer becomes a vector of 32 boolean variables, one per bit.
+
+Consider a 4-bit unsigned integer $x = (x_3, x_2, x_1, x_0)$, where $x_3$ is the most significant bit. To check the condition $x > 4$, the SMT solver observes that $4 = (0,1,0,0)_2$ and reasons case-by-case over the leading bits: if $x_3 = 1$ then $x \geq 8 > 4$ regardless; if $x_3 = 0$ and $x_2 = 1$ then $x \in \{4,\ldots,7\}$, and $x > 4$ requires at least one of $x_1, x_0$ to be $1$; otherwise $x \leq 3$. The SMT solver therefore translates $x > 4$ into the propositional formula
+\[
+    x_3 \;\lor\; \bigl(x_2 \;\land\; (x_1 \lor x_0)\bigr)
+\]
+and passes this purely boolean clause to the SAT solver.
+
 
 \subsection{Expressions}
 
@@ -210,23 +266,9 @@ Patronus\cite{cucapra2024patronus} represents expressions under the class \texti
 
 \subsection{Symbolic Execution}
 
-One of the key challenges of implementing symbolic execution is being able to distinguish whether or not a path is feasible or not. Consider the execution from Figure~\ref{fig:symbolic-trace-with-constraint} row 3. The question are we suppose to tell that this path represents is infeasible?
-
-As always in computer science, one of the best ways to model something is to make it someone else's problem; take an answer to an existing hard solution and leverage it to solve your problem. Here, we leverage a SAT solver to answer these ambiguous questions for us. Now, all we need to do is translate each branching statement into a serious of binary equations.
-
-We represent integers as bit-vectors of their binary representation. A standard 32-bit integer would instead be represented as size 32 vector of booleans. 
-
-We represent the state of an symbolic execution with the following tripe: $(P, M, C)$, where $P$ holds the path conditions, $M$ is the mapping which translates variables to symbols, and $C$ is the current command we are processing. Suppose that the command we are trying to process is an if statement with the form $C(c, t, f)$, where $c$ is the condition, $t$ is the return value if the condition is true, and false being the return value if the condition is false. To update the state, we run the following queries in the SMT Solver:
-\begin{enumerate}
-    \item{$P\land c = \textit{SAT} \land P\land \lnot c = \textit{SAT}$}: The SMT solver says that both paths are feasible. In this case, we create two branching executions one with $P'=P\land c$ and one with $P'=P\land \lnot c$. 
-    \item {$P\land c = \textit{SAT} \land P\land \lnot c = \textit{UNSAT}$}: The SMT solver says that the path such that $\lnot c$ is impossible. This means that given the information of $P$, $\lnot c$ is infeasible. As such, we do not need to add $\lnot c$ into the path, as the information is already recorded in the path. You can think of this as a node with one branch. It has no other choice so no branching executions are created. Consider $P=(x==10)\land (y==11), c=(x+y>12)$. There is no need to add $c$ to the execution path because the value is already included in $P$. 
-    \item {$P\land c = \textit{UNSAT} \land P\land \lnot c = \textit{SAT}$}: She SMT solver says that the path such that $c$ is impossible. Similar to the previous case, we do not need to add $c$ onto the path as the information for deducing $\lnot c$ is already included in $P$. 
-    \item {$P\land c = \textit{UNSAT} \land P\land \lnot c = \textit{UNSAT}$}: The result states that regardless of $c$ the execution is infeasible. This must mean that $P$ is infeasible, which means the constraints were infeasible. 
-\end{enumerate} 
-
 \subsection{Initialize}
 
-You start in the initiation step. Each state variable will start with an symbolic value. However, if it has an initial value, the state variable will be assigned to that instead. For simplicity, values assigned at each timestep will have a timestep added as part of its symbol. This is to distinguish between symbols added and important for identifying different symbols for the input.
+In the initiation, each state variable will starts with an symbolic value. However, if the state variable has an initial value, it will be assigned to that instead. For simplicity, values assigned at each timestep will have a timestep added as part of its symbol. This is to distinguish between symbols added and important for identifying different symbols for the input.
 
 \subsection{Simplification}
 
@@ -300,6 +342,46 @@ Consider the expression $\mathit{add}(\mathit{ite}(x, 1, 2),\; \mathit{ite}(y, 2
     \caption{Path-exploration tree for $\mathit{add}(\mathit{ite}(x,1,2),\mathit{ite}(y,2,3))$. Each internal node shows an ITE being resolved; edges are labelled with the branch condition and its concrete value. Leaves show the fully resolved result and the accumulated path conditions $P$.}
     \label{fig:nested-ite-tree}
 \end{figure}
+
+Not every \textit{ite} expression necessarily results in a branch during symbolic execution. Consider the expression $ite(x>2, ite(x>1, 0, 1), 1)$: the condition of the inner \textit{ite} is already entailed by the outer condition, rendering one of its branches unreachable. To handle this precisely, we issue the following queries to the SMT solver:
+\begin{enumerate}
+    \item{$P\land c = \textit{SAT} \land P\land \lnot c = \textit{SAT}$}: The SMT solver says that both paths are feasible. In this case, we create two branching executions one with $P'=P\land c$ and one with $P'=P\land \lnot c$. 
+    \item {$P\land c = \textit{SAT} \land P\land \lnot c = \textit{UNSAT}$}: The SMT solver says that the path such that $\lnot c$ is impossible. This means that given the information of $P$, $\lnot c$ is infeasible. As such, we do not need to add $\lnot c$ into the path, as the information is already recorded in the path. You can think of this as a node with one branch. It has no other choice so no branching executions are created. Consider $P=(x==10)\land (y==11), c=(x+y>12)$. There is no need to add $c$ to the execution path because the value is already included in $P$. 
+    \item {$P\land c = \textit{UNSAT} \land P\land \lnot c = \textit{SAT}$}: She SMT solver says that the path such that $c$ is impossible. Similar to the previous case, we do not need to add $c$ onto the path as the information for deducing $\lnot c$ is already included in $P$. 
+    \item {$P\land c = \textit{UNSAT} \land P\land \lnot c = \textit{UNSAT}$}: The result states that regardless of $c$ the execution is infeasible. This must mean that $P$ is infeasible, which means the constraints were infeasible. 
+\end{enumerate} 
+
+\subsection{Path Merging}
+
+The current implementation of symbolic execution with just one \textit{ite} expression will double in size with each step. Consider the following state: $x:=\textit{ite}(i>0,x+1, x-1)$. Given the constraint that $i$ is an input and that $i$ is either $1$ or $0$, there is exists two branches in each step. As such within $5$ steps, the number of symbolic execution paths will be $2^5=32$. 
+
+To counter state explosion, we imploy is path merging. In the previous example, consider the branch that the input is first $0$ then $1$ versus first $1$ then $0$. Both symbolic paths result in the same system state. As a result, we can combine the two paths with an $\land$ to prevent state explosion.
+
+Figure~\ref{fig:path-merging} illustrates the first two steps of this example ($x_0$ is the initial value of $x$). Without merging, the four paths at step~2 are tracked separately. With merging, the two paths that reach $x=x_0$ (one via $i_1{=}0,i_2{=}1$ and one via $i_1{=}1,i_2{=}0$) are combined, reducing the live path count.
+
+\begin{figure}[h]
+\centering
+\begin{tabular}{ccccc}
+\hline
+\textbf{Step} & \textbf{$i$ sequence} & \textbf{Value of $x$} & \textbf{Path condition} & \textbf{Merged?} \\
+\hline
+0 & --- & $x_0$ & $\top$ & --- \\
+\hline
+1 & $i_1{=}1$ & $x_0+1$ & $i_1>0$ & No \\
+1 & $i_1{=}0$ & $x_0-1$ & $\lnot(i_1>0)$ & No \\
+\hline
+2 & $i_1{=}1,\;i_2{=}1$ & $x_0+2$ & $i_1>0 \land i_2>0$ & No \\
+2 & $i_1{=}1,\;i_2{=}0$ & $x_0$   & $i_1>0 \land \lnot(i_2>0)$ & \multicolumn{1}{l}{$\}$ merged} \\
+2 & $i_1{=}0,\;i_2{=}1$ & $x_0$   & $\lnot(i_1>0) \land i_2>0$ & \\
+2 & $i_1{=}0,\;i_2{=}0$ & $x_0-2$ & $\lnot(i_1>0) \land \lnot(i_2>0)$ & No \\
+\hline
+2 (merged) & $i_1{\ne} i_2$ & $x_0$ & $(i_1>0 \land \lnot(i_2>0)) \lor (\lnot(i_1>0) \land i_2>0)$ & \checkmark \\
+\hline
+\end{tabular}
+\caption{Path explosion and merging for $x := \mathit{ite}(i{>}0,\, x{+}1,\, x{-}1)$ over two steps. The two step-2 paths that reach $x_0$ are merge candidates; their path conditions are joined with $\lor$.}
+\label{fig:path-merging}
+\end{figure}
+
 
 
 \section{Conclusion}
