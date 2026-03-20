@@ -13,7 +13,7 @@
 \bibliographystyle{plain}
 
 
-\title{TODO Add a name}
+\title{Symbolic Execution Engine for BTOR Systems}
 \author{Kevin Chen}
 \date{\today}
 
@@ -25,11 +25,15 @@
 
 TODO insert introduction
 
-\section{Symbolic Execution}
+\section{Background}
+
+\subsection{Symbolic Execution}
 
 Symbolic execution is a way of executing a program abstractly, such that on abstract execution covers multiple possible inputs of the program that share a particular execution path through the code \cite{aldrich2018symbolic}. Each input of symbolicly executed code is represented as a symbol rather than assigning it a concrete value. When the value is referenced such as for an if statement, the execution path branches, where one path the symbolic value is evaluated as true while the other path the symboilic value is evaluated as false.
 
-One of the key uses for symbolic execution is in testing. Most unit tests, require the programmer to hardcode in values to test, resulting in various unit tests to cover all branches the code can tranverse. On the other hand, a symbolic execution would execute simutaneously on a family of inputs. Consider the following example:
+\subsubsection{Symbolic Execution in Industry}
+
+One of the key uses for symbolic execution is in testing. Most unit tests, require the programmer to hardcode in values to test, resulting in various unit tests to cover all branches the code can tranverse. On the other hand, a symbolic execution would execute simutaneously for all possible inputs. Algorithm~\ref{alg:simple-example} gives the following example.
 
 \begin{algorithm}
     \caption{Algorithm 1}
@@ -45,15 +49,13 @@ One of the key uses for symbolic execution is in testing. Most unit tests, requi
     \end{algorithmic}
 \end{algorithm}
     
-With a glance, we can see that using any combination of numbers such that their sum results in an even number will result in an error. There is no way to cover all cases of failure using unit tests, as there are an infinite number of way which we can stumble onto this error.
-
-Instead of testing with unit tests such as $x=1, y=1$, symbolic execution represents the inputs as symbols $x=x_0, y= y_0$. Whenever, the symbols are required to return a value, such as in a branch, symbolic execution splits into two executions, with each execution recording the branching condition in its execution path. Consider a symbolic execution of the algorithm above. We start with representing each input symbolicly:
+With a glance, we can see that using any combination of numbers such that their sum results in an even number will result in an error. There is no way to cover all cases of failure using unit tests, as there are an infinite number of way which we can stumble onto this error. Instead of testing with unit tests such as $x=1, y=1$, symbolic execution represents the inputs as symbols $x=x_0, y= y_0$. Consider a symbolic execution of the algorithm above; Figure~\ref{fig:symbolic-trace} shows how we start with representing each input symbolically.
 
 \begin{figure}[H]
     \centering
     \begin{tabular}{|c|c|c|}
         \hline
-        line & Path Condition & Translation \\
+        line & Path Condition & Variable Assignments \\
         \hline
         0 & true & $x\to x_0, y\to y_0$ \\
         1 & true & $x\to x_0, y\to y_0, a\to x_0+y_0$ \\
@@ -67,7 +69,7 @@ Instead of testing with unit tests such as $x=1, y=1$, symbolic execution repres
     \label{fig:symbolic-trace}
 \end{figure}
 
-In this example, we see that the inputs values start symbolic as symbols which has no concrete value. Following the execution, we translate every instance of $x$ with $x_0$ with the same case for $y$. Where it gets interesting is when the the execution has a branching path. In the $\textbf{if}$ statement, the value of a is required to be assigned a value, which breaks the symbolic abstraction. Instead, the symbolic execution branches into two different executions, each of which assuming a different condition to satisfy the branching statement. Below we can visualize the different execution paths the execution takes via a simple tree (see Figure~\ref{fig:execution-tree}):
+In this example, we see that the inputs values start symbolic as symbols which has no concrete value. Following the execution, we translate every instance of $x$ with $x_0$ with the same case for $y$. Where it gets interesting is when the the execution has a branching path. In the if statement, because a is symbolic, the executor cannot evaluate the condition concretely. Instead, execution forks into two paths, each assuming a different outcome of the condition and adding the corresponding constraint to the path condition. Figure~\ref{fig:execution-tree} shows the different execution paths the execution takes via a simple tree.
 
 \begin{figure}[H]
     \centering
@@ -91,7 +93,20 @@ In this example, we see that the inputs values start symbolic as symbols which h
     \label{fig:execution-tree}
 \end{figure}
 
-In each paths, we accumulate the different path conditions until we either reach the end (return statement) or a failure (error). In this case, we find that there exists a set of inputs (when $x_0+y_0 \bmod 2 = 0$), which causes an error. Now imagine a different example; using the same coding example, but with a twist. Prior to running this program with symbolic execution, one can add constraints to the path. Below, an example where we start with a given constraint that $x_0+y_0=1$:
+In each paths, we accumulate the different path conditions until we either reach the end of function or a failure. Our symbolic execution analysis shows us that there are two possible families of results: one which results in an error and one in a valid return value. Tracing its path constraint reviews to us that the family of inputs satisfy the constraint $a\bmod 2 == 0$ results in an error. Now imagine a similar example, but with a twist. Prior to running this program with symbolic execution, one can add constraints to the path. Algorithm~\ref{alg:precondition-example} gives an example where we start with a given constraint that $x_0+y_0=1$.
+
+\begin{algorithm}
+    \caption{Algorithm 1 called with a precondition}
+    \label{alg:precondition-example}
+    \begin{algorithmic}[1]
+    \Require $x, y \in \mathbb{Z}$
+    \If{$x + y = 1$}
+        \State \Call{Algorithm1}{$x, y$}
+    \EndIf
+    \end{algorithmic}
+\end{algorithm}
+
+With the constraint, intuitively we can see that the possibility to return an error is impossible. Symbolic execution reflects this by maintaining a path of path constraints and pruning out infeasible outcomes (Figure~\ref{fig:symbolic-trace-with-constraint}).
 
 \begin{figure}[H]
     \centering
@@ -111,11 +126,11 @@ In each paths, we accumulate the different path conditions until we either reach
     \label{fig:symbolic-trace-with-constraint}
 \end{figure}
 
-With the constraint, the path condition which leads to the error is contradictory. This illustrates that the path is impossible. With this constraint, we see that no path leads to any errors. In industry, programmers, can create tests with given preconditions (constraints) and run until the program terminates. Instead of throwing an error, we can use assertion statements as post-conditions. If it terminates without an error, the program is robust across all set of inputs. Otherwise, a symbolicly executed program will return a concrete set of conditions which will give an error or violate a post-condtiion.
+With the constraint, the path condition which leads to the error is contradictory, which shows that the path is impossible and no paths lead to errors. In industry, programmers, can create tests with given preconditions (constraints) and run until the program terminates. Instead of throwing an error, we can use assertion statements as post-conditions. If it terminates without an error, the program is robust across all set of inputs. Otherwise, a symbolicly executed program will return a concrete set of conditions which will give an error or violate a post-condtiion.
 
-\subsection{While loops}
+\subsubsection{While loops}
 
-To represent a while loop in symbolic execution, we unroll it into a recursive function with no loops. Take the following code for instance:
+A while loop can be viewed as repeated conditional branching. At each iteration, the loop condition is evaluated, and execution either continues into the loop body or exits the loop. In this sense, a while loop behaves like an if statement that is evaluated repeatedly, where each evaluation produces a new branch in the execution path. Because symbolic execution already handles branching through constructs such as if statements, loops can be handled in a variety of ways. In imperative symbolic execution engines, loops are typically handled directly by repeatedly exploring these branches. In declarative or functional settings, another common approach is to represent the loop by unrolling it into a recursive function. This removes the explicit loop construct while preserving the same branching behavior. For illustration, see Algorithm~\ref{alg:count-ones-while}.
 
 \begin{algorithm}
     \caption{Count Number of 1's in a Bit Vector}
@@ -133,8 +148,6 @@ To represent a while loop in symbolic execution, we unroll it into a recursive f
     \State \Return $count$
     \end{algorithmic}
 \end{algorithm}
-
-We can rewrite it as a recursive function: 
 
 \begin{algorithm}
     \caption{Recursively Count Number of 1's in a Bit Vector}
@@ -154,7 +167,7 @@ We can rewrite it as a recursive function:
     \end{algorithmic}
 \end{algorithm}
 
-Now that we have rewritten the while loop as if statements, we simply create a new branch for every if statement. In practice, this may lead to state explosion, resulting in thousands of branches in a just a few iterations. Programmers either set a recursion limit, terminating the branch which gets stuck, or find a different way to represent the while loop, using the loop invariant. Below is a tree of the branching paths created from a symbolic execution of Algorithm~\ref{alg:recursive-count-ones}. 
+Algorithm~\ref{alg:recursive-count-ones} rewrites it as a recursive function. In practice, splitting branches continous may lead to state explosion, where thousands of branches consume memory within iterations. To combat this, programmers either set a recursion limit, terminating the branch which gets stuck, or find a different way to represent the while loop, using the loop invariant. Figure~\ref{fig:recursive-execution-tree} shows a tree of the branching paths created from a symbolic execution of Algorithm~\ref{alg:recursive-count-ones}.
 
 \begin{figure}[H]
     \centering
@@ -197,36 +210,24 @@ Now that we have rewritten the while loop as if statements, we simply create a n
     \label{fig:recursive-execution-tree}
 \end{figure}
 
-\section{Patronus}
-
 \subsection{BTOR2}
 
 BTOR2 is a word-level model checking format for capturing models of hardware and potentially software in a bit-precise manner. The exact architecture in which it is defined can be found at \cite{niemetz2018btor2}.
 
-For the purposes of this project, we simplify the language into a transition system which holds state variables, inputs, constraints, and bad states. To set up the system, the state variables start by holding some initial value and transition function. To take a step in the system, translate all the state variables through their existing transition functions. Inputs are free, nondeterministic values chosen at each transition, so long as they satisfy all constraints. At the end of the step, check that the bad state predicate is not satisfied.
+For the purposes of this project, we parse the language into a \emph{transition system}, formalized as a tuple $(\mathcal{S},\,\mathcal{I},\,\mathit{init},\,\mathit{next},\,\mathcal{C},\,\mathcal{B})$:
+\begin{itemize}
+    \item $\mathcal{S}$: the set of state variables;
+    \item $\mathcal{I}$: the set of free (input) variables;
+    \item $\mathit{init}$: for each $s \in \mathcal{S}$, the initial value $\mathit{init}(s)$;
+    \item $\mathit{next}$: for each state variable $s \in \mathcal{S}$, the next-state function $\mathit{next}(s,\,\mathcal{I})$ giving the value of $s$ after one step as a function of the current state and chosen inputs;
+    \item $\mathcal{C}$: the set of constraints that every chosen input must satisfy at each step; and
+    \item $\mathcal{B}$: the bad-state predicate; the system is unsafe if some execution reaches a state satisfying $\mathcal{B}$.
+\end{itemize}
+These components map directly to BTOR2: \texttt{state} (with \texttt{init} and \texttt{next}), \texttt{input}, \texttt{constraint}, and \texttt{bad}.
 
-The components of the transition system map directly to BTOR2 keywords: \texttt{state} (with \texttt{init} and \texttt{next}) for state variables, \texttt{input} for free inputs, \texttt{constraint} for invariant assumptions on inputs, and \texttt{bad} for the safety violation predicate. Algorithm~\ref{alg:btor2-bmc} formalizes this execution model; Table~\ref{fig:btor2-trace} traces a concrete two-step run that witnesses a bad state.
+The BTOR interpreter runs the transition system step by step: it initializes each state variable using $\mathit{init}$, then at each step chooses concrete values for the inputs in $\mathcal{I}$ that satisfy the constraints in $\mathcal{C}$, evaluates each next-state function in $\mathit{next}$, and updates the state accordingly. After each step, it checks whether the resulting state satisfies the bad-state predicate $\mathcal{B}$.
 
-\begin{algorithm}
-    \caption{BTOR2 Bounded Model Checking}
-    \label{alg:btor2-bmc}
-    \begin{algorithmic}[1]
-    \Require Transition system $(\mathcal{S},\,\mathcal{I},\,\mathit{init},\,\mathit{next},\,\mathcal{C},\,\mathcal{B})$; bound $K$
-    \State \textbf{Init:} for each $s \in \mathcal{S}$, set $s \gets \mathit{init}(s)$
-    \For{$k = 0, 1, \ldots, K$}
-        \If{$\mathcal{B}(\text{state})$}
-            \State \Return \textsc{Unsafe} \Comment{bad state reached at step $k$}
-        \EndIf
-        \State Choose values for each $i \in \mathcal{I}$ satisfying every $c \in \mathcal{C}$
-        \For{each $s \in \mathcal{S}$}
-            \State $s \gets \mathit{next}(s,\,\mathcal{I})$
-        \EndFor
-    \EndFor
-    \State \Return \textsc{Unknown}
-    \end{algorithmic}
-\end{algorithm}
-
-Consider a system with one state variable $s$ (initialized to $0$, $\mathit{next}(s) = s + \mathit{inp}$), one free input $\mathit{inp}$ constrained by $\mathit{inp} \geq 1$, and bad state $\mathcal{B} \equiv s \geq 3$.
+Consider a system with one state variable $s$ (initialized to $0$, $\mathit{next}(s) = s + \mathit{inp}$), one free input $\mathit{inp}$ constrained by $\mathit{inp} \geq 1$, and bad state $\mathcal{B} \equiv s \geq 3$. Table~\ref{fig:btor2-trace} shows a concrete two-step run that reaches a bad state.
 
 \begin{figure}[H]
     \centering
@@ -249,29 +250,125 @@ Consider a system with one state variable $s$ (initialized to $0$, $\mathit{next
 
 One of the key challenges of implementing symbolic execution is being able to distinguish whether or not a path is feasible or not. How should a symbolic executor tell whether or not a path is feasible such as in Figure~\ref{fig:symbolic-trace-with-constraint} row 4 or infeasible, like in Figure~\ref{fig:symbolic-trace-with-constraint} row 3.
 
-As always in computer science, one of the best ways to model something is to make it someone else's problem: take an existing solution to a hard problem and leverage it to solve your own. Here, we leverage a SAT solver to determine path feasibility. The remaining challenge is translating each branching condition into a series of boolean equations. This is the role of an SMT (Satisfiability Modulo Theories) solver, which lifts raw SAT solving to richer data types. For example, integers are modeled as fixed-width bit-vectors; a standard 32-bit integer becomes a vector of 32 boolean variables, one per bit.
+As always in computer science, one of the best ways to model something is to make it someone else's problem: take an existing solution to a hard problem and leverage it to solve your own. Here, we leverage a SAT solver to determine path feasibility. The remaining challenge is translating each branching condition into a series of boolean equations. This is the role of an SMT (Satisfiability Modulo Theories) solver, which lifts raw SAT solving to richer data types (e.g., integers, bit-vectors). 
 
-Consider a 4-bit unsigned integer $x = (x_3, x_2, x_1, x_0)$, where $x_3$ is the most significant bit. To check the condition $x > 4$, the SMT solver observes that $4 = (0,1,0,0)_2$ and reasons case-by-case over the leading bits: if $x_3 = 1$ then $x \geq 8 > 4$ regardless; if $x_3 = 0$ and $x_2 = 1$ then $x \in \{4,\ldots,7\}$, and $x > 4$ requires at least one of $x_1, x_0$ to be $1$; otherwise $x \leq 3$. The SMT solver therefore translates $x > 4$ into the propositional formula
+One possible way to reduce bit-vector constraints to SAT: model fixed-width integers as bit-vectors (e.g., a 32-bit integer as 32 boolean variables) and encode comparisons as propositional formulas. As a concrete example of such a reduction, consider a 4-bit unsigned integer $x = (x_3, x_2, x_1, x_0)$, where $x_3$ is the most significant bit. One way to encode the condition $x > 4$ is to observe that $4 = (0,1,0,0)_2$ and reason case-by-case over the leading bits: if $x_3 = 1$ then $x \geq 8 > 4$; if $x_3 = 0$ and $x_2 = 1$ then $x \in \{4,\ldots,7\}$, and $x > 4$ requires at least one of $x_1, x_0$ to be $1$; otherwise $x \leq 3$. This yields the propositional formula
 \[
     x_3 \;\lor\; \bigl(x_2 \;\land\; (x_1 \lor x_0)\bigr)
 \]
-and passes this purely boolean clause to the SAT solver.
+which can be passed to a SAT solver. Thus, bit-vector SMT can be lowered to SAT in this way; actual SMT solvers may use different encodings or avoid full bit-blasting.
 
+\subsubsection{Bounded Model Checking}
 
-\subsection{Expressions}
+Rather than implementing a symbolic execution engine, a simpler way of checking program correctness is with Bounded Model Checking(BMC). Here, this verification system translates the program into a system of SMT queries and checks if there exists an example which results in an error.
 
-Patronus\cite{cucapra2024patronus} represents expressions under the class \textit{Expr} and $\textit{ExprRef}$. Each expression is an object which contains the type of expression and a list of \textit{ExprRef} to other expressions. For example, the expression $if (x==4, y+=3, z+=4)$ can be represented as $ite(\textit{ExprRef}[1], \textit{ExprRef}[2], \textit{ExprRef}[3])$. The expressions are stored all in an Context.
+Using the transition system style from Table~\ref{fig:btor2-trace}, BMC keeps the inputs symbolic and asks whether there exists an assignment within the chosen bound that reaches a bad state. For example, let the initial state be $1$, let $\mathit{next}(s)=s+\mathit{inp}$, and let the bad predicate be $s \geq 4$. Unrolling the system for one step yields Table~\ref{fig:bmc-trace}. The check fails within one step because choosing $i_0 = 3$ gives the next state $1 + i_0 = 4$, which satisfies the bad predicate.
+
+\begin{figure}[H]
+    \centering
+    \begin{tabular}{|c|c|c|c|c|}
+        \hline
+        \textbf{step} & \textbf{state} & \textbf{input} & \textbf{next state} & \textbf{bad} \\
+        \hline
+        Init & $1$ & $i_0$ & $i_0 + 1$ & $-$ \\
+        \hline
+        1 & $1 + i_0$ & $i_1$ & $i_1 + i_0 + 1$ & yes \\
+        \hline
+    \end{tabular}
+    \caption{One-step bounded model checking trace for the transition system induced by Table~\ref{fig:btor2-trace}. The inputs remain symbolic, and the checker asks whether some assignment, such as $i_0 = 3$, makes the bad predicate true within the bound.}
+    \label{fig:bmc-trace}
+\end{figure}
+
+This technique is called BMC as it only checks for a finite number of steps. Suppose that the input was constrainted such that $0<i<2$ and that the bad state required the state be $>10$. With a maximum of $9$ steps, BMC would stop after $9$ step concluding that there exists no error.
 
 \section{Implementation}
+
+The high-level goal of our implementation is to perform symbolic execution on BTOR2 transition systems. In this setting, the configuration of the system is the valuation of all its state variables: each state variable holds a value (concrete or symbolic), and two configurations are equivalent if they assign the same value to every state variable. To compute the next step, each configuration is transformed according to the transition function: the next-state expression for each state variable is evaluated, possibly using symbolic inputs, and the result becomes that variable's new value.
+
+Because inputs can be nondeterministic and next-state expressions may contain \texttt{ite} (conditional) branches, a single configuration can lead to multiple successor configurations. We therefore maintain a set of paths, where each path is a pair of (i) a configuration, the current symbolic values of all state variables, and (ii) a path condition: the conjunction of assumptions made to reach that configuration. Given a system and a step bound, we initialize the set of paths, repeatedly apply the transition function to each path's configuration to obtain new paths, and check whether any path reaches a configuration satisfying the bad-state predicate.
+
+\subsection{Step-by-Step Example}
+
+First we illustrate how the symbolic executor runs with an example BTOR2 model. First, the transition system is given by Algorithm~\ref{alg:quiz1}.
+
+\begin{algorithm}
+    \caption{Quiz1 transition system}
+    \label{alg:quiz1}
+    \begin{algorithmic}[1]
+    \State \textbf{Input:} \texttt{reset} (1-bit)
+    \State \textbf{State:} \texttt{counter} (16-bit), \texttt{\_resetCount} (1-bit)
+    \State \textbf{Init:} \texttt{\_resetCount} $\gets 0$
+    \State \textbf{Constraint:} $\mathit{implies}(\neg(\mathit{\_resetCount} \geq 1), \mathit{reset})$
+    \State \textbf{Bad:} $\neg\mathit{reset} \land (\mathit{counter} > 1)$
+    \State \textbf{Next:}
+    \State \quad \texttt{counter} $\gets$ \texttt{ite}(\texttt{reset}, $0$, \texttt{counter} $+ 1$)
+    \State \quad \texttt{\_resetCount} $\gets$ \texttt{ite}(\texttt{\_resetCount} $< 1$, $1$, \texttt{\_resetCount})
+    \end{algorithmic}
+\end{algorithm}
+
+\textbf{Step 0} The executor begins with the initial configuration. Step 0 starts with one path and no assumptions (path condition $\mathit{true}$). We set up the state variables: the BTOR2 model gives \texttt{counter} no explicit initial value, so we assign it a fresh timestamped symbol \texttt{counter\_t0} (16-bit). \texttt{\_resetCount} (1-bit) is initialized to $0$ as specified. At each step, the input \texttt{reset} is chosen nondeterministically and represented by a timestamped symbol (e.g., \texttt{reset\_t0} at step 0, \texttt{reset\_t1} at step 1). The system constraint $\mathit{implies}(\neg(\mathit{\_resetCount} \geq 1), \mathit{reset})$ has antecedent true (since $\mathit{\_resetCount} = 0$), so \texttt{reset} must hold. Thus the path condition includes \texttt{reset}. The table below shows the single path: \texttt{counter} $= \texttt{counter\_t0}$, \texttt{\_resetCount} $= 0$.
+
+\begin{center}
+\begin{tabular}{|c|l|c|c|}
+\hline
+\textbf{Path} & \textbf{Constraints} & \textbf{counter (16-bit)} & \textbf{\_resetCount (1-bit)} \\
+\hline
+1 & \texttt{reset} & \texttt{counter\_t0} & 0 \\
+\hline
+\end{tabular}
+\end{center}
+
+\textbf{Step 1} We take each path produced at step 0 and apply the transition function to it. Step 0 had one path, so we have one path to process. We introduce \texttt{reset\_t0} for the input at this step. The constraint forced \texttt{reset} to hold at step 0, so we are in the ``reset'' branch of the \texttt{ite}: \texttt{counter} becomes $0$ and \texttt{\_resetCount} becomes $1$. After the transition, $\mathit{\_resetCount} = 1$, so $\neg(\mathit{\_resetCount} \geq 1)$ is false and the system constraint is vacuously satisfied (simplifies to $\mathit{true}$). The path condition remains \texttt{reset} (or true). We still have one path: \texttt{counter} $= 0$, \texttt{\_resetCount} $= 1$.
+
+\begin{center}
+\begin{tabular}{|c|l|c|c|}
+\hline
+\textbf{Path} & \textbf{Constraints} & \textbf{counter (16-bit)} & \textbf{\_resetCount (1-bit)} \\
+\hline
+1 & $\mathit{true}$ & 0 & 1 \\
+\hline
+\end{tabular}
+\end{center}
+
+\textbf{Step 2} We take each path from step 1 and apply the transition. Step 1 had one path, so we start with one path. We introduce \texttt{reset\_t1} for the input at this step. The next-state expression for \texttt{counter} is \texttt{ite}(\texttt{reset}, $0$, \texttt{counter} $+ 1$). We cannot evaluate this concretely because \texttt{reset} $= \texttt{reset\_t1}$ is symbolic. We create two successor paths, one assuming \texttt{reset\_t1} $= \mathit{true}$, one assuming \texttt{reset\_t1} $= \mathit{false}$. \textbf{Path 1} (reset held): \texttt{reset\_t1} $= \mathit{true}$, so \texttt{counter} stays $0$ and \texttt{\_resetCount} stays $1$. Path condition: \texttt{reset\_t1}. \textbf{Path 2} (reset false): \texttt{reset\_t1} $= \mathit{false}$, so \texttt{counter} becomes $1$ and \texttt{\_resetCount} stays $1$. Path condition: $\neg$\texttt{reset\_t1}. We now have two paths, each inheriting from the single path at step 1 but branching on the symbolic input.
+
+\begin{center}
+\begin{tabular}{|c|l|c|c|}
+\hline
+\textbf{Path} & \textbf{Constraints} & \textbf{counter (16-bit)} & \textbf{\_resetCount (1-bit)} \\
+\hline
+1 & \texttt{reset\_t1} & 0 & 1 \\
+2 & \texttt{not(reset\_t1)} & 1 & 1 \\
+\hline
+\end{tabular}
+\end{center}
+
+\textbf{Step 3} We take each of the two paths from step 2 and apply the transition. For each path, we introduce \texttt{reset\_t2} for the input at this step. Each path branches on \texttt{reset\_t2} (true or false), yielding four paths with no merging. \textbf{Path 1} continues from step 2 path 1 with \texttt{reset\_t2} $= \mathit{true}$: \texttt{counter} stays $0$. Path condition: \texttt{reset\_t1} $\land$ \texttt{reset\_t2}. \textbf{Path 2} continues from step 2 path 1 with \texttt{reset\_t2} $= \mathit{false}$: \texttt{counter} was $0$, so it becomes $1$. Path condition: \texttt{reset\_t1} $\land$ $\neg$\texttt{reset\_t2}. \textbf{Path 3} continues from step 2 path 2 with \texttt{reset\_t2} $= \mathit{true}$: \texttt{counter} was $1$, so it becomes $0$. Path condition: $\neg$\texttt{reset\_t1} $\land$ \texttt{reset\_t2}. \textbf{Path 4} continues from step 2 path 2 with \texttt{reset\_t2} $= \mathit{false}$: \texttt{counter} was $1$, so it becomes $2$. Path condition: $\neg$\texttt{reset\_t1} $\land$ $\neg$\texttt{reset\_t2}. The bad-state predicate is $\neg\mathit{reset} \land (\mathit{counter} > 1)$. On path 4, \texttt{reset\_t2} $= \mathit{false}$ (so $\neg\mathit{reset}$ holds) and \texttt{counter} $= 2 > 1$, so the bad state is satisfied. The executor reports that the system is unsafe: a concrete trace (e.g., \texttt{reset\_t0} $= \mathit{true}$, \texttt{reset\_t1} $= \mathit{false}$, \texttt{reset\_t2} $= \mathit{false}$) reaches the bad state at step 3.
+
+\begin{center}
+\begin{tabular}{|c|l|c|c|}
+\hline
+\textbf{Path} & \textbf{Constraints} & \textbf{counter (16-bit)} & \textbf{\_resetCount (1-bit)} \\
+\hline
+1 & \texttt{reset\_t1}, \texttt{reset\_t2} & 0 & 1 \\
+2 & \texttt{reset\_t1}, \texttt{not(reset\_t2)} & 1 & 1 \\
+3 & \texttt{not(reset\_t1)}, \texttt{reset\_t2} & 0 & 1 \\
+4 & \texttt{not(reset\_t1)}, \texttt{not(reset\_t2)} & 2 & 1 \\
+\hline
+\end{tabular}
+\end{center}
+
 \subsection{Initialize}
 
 In the initiation, each state variable will starts with an symbolic value. However, if the state variable has an initial value, it will be assigned to that instead. For simplicity, values assigned at each timestep will have a timestep added as part of its symbol. This is to distinguish between symbols added and important for identifying different symbols for the input.
 
+\subsection{Execution Path}
+
+A single execution path stores the symbolic information associated with one feasible branch of execution. The \texttt{state\_translation} records the current symbolic value of each state variable, that is, the current configuration reached along that path. The \texttt{path\_conditions} record the conjunction of assumptions required to reach that configuration, such as branch decisions and input constraints. Together, these two pieces of information describe both the current symbolic state and the conditions under which that state is reachable.
+
 \subsection{Simplification}
 
-The goal of simplification is to have values as simplist terms. This means that each expression must contain basic terms, such as numbers or symbols, things that cannot be further simplified. 
-
-Assume you have all the basic rules for simplification. One example is if you add two integers, the result should just be the sum of the integers. Another is if you have an if statement and the condition is true, then it should simplify to just the true branch. 
+The goal of simplification is to reduce expressions to forms that cannot be simplified any further. This process relies on a set of basic simplification rules that operate only on the surface structure of an expression. These rules are simple and locally applicable. For example, if both operands of an addition are integers, the expression can be simplified to their sum. Similarly, if the condition of an if expression evaluates to true, the entire expression simplifies to the true branch. However, these rules apply only when their conditions are directly satisfied at the top level of the expression. If an operand is itself a more complex expression (for example, an addition where one operand is symbolic), the rule does not apply. Simplification therefore proceeds by repeatedly applying these basic rules wherever they match. The process continues until no rule can be applied anymore, at which point the expression has reached a fixed point and is considered fully simplified.
 
 To simplify expressions and expression references, we need to start by simplifying the inner most layer. This is implemented with a stack. Each child of an expression gets added to a stack and the last children added is popped and simplified. Table~\ref{fig:btor-simplify} traces this algorithm on the expression $\mathit{If}(\mathit{true}, \mathit{If}(\mathit{add}(0,1), 4, 5), -1)$: the first column is the step (number of pops), the second is the current result overall (the full expression with all completed simplifications applied so far), the third is the current simplification target (the expression just popped), and the fourth is the stack (top to bottom) after pushing that target's children, if any. The expression simplifies to $4$: $-1$, $4$, and $5$ do not simplify; $\mathit{add}(0,1)$ simplifies to $1$; $\mathit{If}(1, 4, 5)$ simplifies to $4$ (condition is true); $\mathit{If}(\mathit{true}, 4, -1)$ simplifies to $4$.
 
@@ -340,6 +437,8 @@ Consider the expression $\mathit{add}(\mathit{ite}(x, 1, 2),\; \mathit{ite}(y, 2
     \label{fig:nested-ite-tree}
 \end{figure}
 
+\subsection{Pruning Redundant Branches}
+
 Not every \textit{ite} expression necessarily results in a branch during symbolic execution. Consider the expression $ite(x>2, ite(x>1, 0, 1), 1)$: the condition of the inner \textit{ite} is already entailed by the outer condition, rendering one of its branches unreachable. To handle this precisely, we issue the following queries to the SMT solver:
 \begin{enumerate}
     \item{$P\land c = \textit{SAT} \land P\land \lnot c = \textit{SAT}$}: The SMT solver says that both paths are feasible. In this case, we create two branching executions one with $P'=P\land c$ and one with $P'=P\land \lnot c$. 
@@ -347,6 +446,10 @@ Not every \textit{ite} expression necessarily results in a branch during symboli
     \item {$P\land c = \textit{UNSAT} \land P\land \lnot c = \textit{SAT}$}: She SMT solver says that the path such that $c$ is impossible. Similar to the previous case, we do not need to add $c$ onto the path as the information for deducing $\lnot c$ is already included in $P$. 
     \item {$P\land c = \textit{UNSAT} \land P\land \lnot c = \textit{UNSAT}$}: The result states that regardless of $c$ the execution is infeasible. This must mean that $P$ is infeasible, which means the constraints were infeasible. 
 \end{enumerate} 
+
+\subsection{Taking a step}
+
+
 
 \subsection{Path Merging}
 
