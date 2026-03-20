@@ -23,9 +23,9 @@
 
 \section{Introduction}
 
-TODO insert introduction
+Verifying that hardware and software systems behave correctly under all possible inputs is a fundamental challenge in computer science. Traditional testing approaches require engineers to enumerate concrete inputs by hand, which makes it difficult to achieve complete coverage of all possible behaviors. Formal verification methods address this limitation by reasoning about all inputs simultaneously, but they often require significant manual effort to apply.
 
-\section{Background}
+This paper presents a symbolic execution engine for transition systems described in the BTOR2 format, a word-level model checking language widely used for hardware verification. Rather than running a system on one concrete input at a time, our engine keeps inputs symbolic and explores all feasible execution paths in parallel, using an SMT solver to determine which branches are reachable and to detect violations of safety properties. When a bad state is reachable, the engine reports both the symbolic expression that was violated and the path condition that witnesses the violation.
 
 \subsection{Symbolic Execution}
 
@@ -358,13 +358,98 @@ First we illustrate how the symbolic executor runs with an example BTOR2 model. 
 \end{tabular}
 \end{center}
 
-\subsection{Initialize}
+\subsection{Initialization}
 
-In the initiation, each state variable will starts with an symbolic value. However, if the state variable has an initial value, it will be assigned to that instead. For simplicity, values assigned at each timestep will have a timestep added as part of its symbol. This is to distinguish between symbols added and important for identifying different symbols for the input.
+Initialization sets up the data structures that the symbolic executor will maintain throughout execution. Before describing the procedure itself, we first examine the two core types it operates on: the \texttt{SymbolicExecutor} struct, which holds all persistent state, and the \texttt{ExecutionPath} struct, which represents a single feasible branch.
 
-\subsection{Execution Path}
+\subsubsection{SymbolicExecutor Fields}
 
-A single execution path stores the symbolic information associated with one feasible branch of execution. The \texttt{state\_translation} records the current symbolic value of each state variable, that is, the current configuration reached along that path. The \texttt{path\_conditions} record the conjunction of assumptions required to reach that configuration, such as branch decisions and input constraints. Together, these two pieces of information describe both the current symbolic state and the conditions under which that state is reachable.
+The \texttt{SymbolicExecutor} struct is the top-level object. It is constructed from a parsed BTOR2 transition system and owns all data that persists across steps:
+
+\begin{center}
+\begin{verbatim}
+pub struct SymbolicExecutor {
+    ts: TransitionSystem,
+    current_step: usize,
+    paths: Vec<ExecutionPath>,
+    state_types: HashMap<ExprRef, Type>,
+    input_types: HashMap<ExprRef, Type>,
+    all_symbols: HashSet<ExprRef>,
+    constraints: Vec<ExprRef>,
+    bad_state: Option<(ExprRef, ExecutionPath)>,
+}
+\end{verbatim}
+\end{center}
+
+\noindent The fields serve the following roles:
+\begin{itemize}
+    \item \texttt{ts} — the parsed BTOR2 model, including the state variables, inputs, next-state expressions, constraints, and bad-state predicates.
+    \item \texttt{current\_step} — the number of transitions that have been applied so far, used to generate unique timestamped names for new symbols.
+    \item \texttt{paths} — the set of active symbolic execution paths. Each path represents one feasible branch of execution reached so far.
+    \item \texttt{state\_types} / \texttt{input\_types} — maps from expression references to their BTOR2 types (bit-vector width or array type), consulted whenever a fresh symbol must be allocated with the correct type.
+    \item \texttt{all\_symbols} — the universe of all symbolic variables that have been introduced. Every variable declared here is forwarded to the SMT solver before checking satisfiability.
+    \item \texttt{constraints} — the system-level constraints copied from the transition system. These are asserted in every SMT query so that only inputs satisfying the BTOR2 \texttt{constraint} declarations are considered.
+    \item \texttt{bad\_state} — set to \texttt{Some} the first time a bad-state predicate is found satisfiable on any path, pairing the violating expression with the witness path. Subsequent calls to \texttt{step} return immediately with \texttt{StepResult::BadStateReached} without modifying any other field.
+\end{itemize}
+
+Each active branch is stored as an \texttt{ExecutionPath}:
+
+\begin{center}
+\begin{verbatim}
+pub struct ExecutionPath {
+    pub state_translation: HashMap<ExprRef, ExprRef>,
+    pub path_conditions: Vec<ExprRef>,
+    pub input_translation: HashMap<ExprRef, ExprRef>,
+    pub new_state_cache: HashMap<ExprRef, ExprRef>,
+}
+\end{verbatim}
+\end{center}
+
+\noindent \texttt{state\_translation} maps each state variable to its current symbolic value along this branch. \texttt{path\_conditions} is the list of branch constraints accumulated to reach this configuration; their conjunction is the path condition. \texttt{input\_translation} maps each input variable to the timestamped symbol allocated for the current step (e.g.\ \texttt{reset\_t0}). \texttt{new\_state\_cache} is a scratch map used during a step to hold freshly computed next-state values before they are committed to \texttt{state\_translation}.
+
+\subsubsection{Initialization Procedure}
+
+The \texttt{init} method creates the single starting path and populates the type maps:
+
+\begin{center}
+\begin{verbatim}
+pub fn init(&mut self, ctx: &mut Context) {
+    for state in &self.ts.states {
+        self.state_types.insert(state.symbol, state.symbol.get_type(ctx));
+    }
+    for input in &self.ts.inputs {
+        self.input_types.insert(*input, input.get_type(ctx));
+    }
+
+    let mut initial_path = ExecutionPath::new();
+
+    for state in &self.ts.states {
+        if let Some(init_expr) = state.init {
+            initial_path.state_translation.insert(state.symbol, init_expr);
+        } else {
+            let name = ctx.get_symbol_name(state.symbol).unwrap_or("state");
+            let t0_name = format!("{}_t0", name);
+            let tpe = self.state_types[&state.symbol];
+            let t0_sym = match tpe {
+                Type::BV(width) => ctx.bv_symbol(&t0_name, width),
+                Type::Array(arr_type) => ctx.array_symbol(
+                    &t0_name, arr_type.index_width, arr_type.data_width),
+            };
+            initial_path.state_translation.insert(state.symbol, t0_sym);
+            self.all_symbols.insert(t0_sym);
+        }
+    }
+
+    self.constraints = self.ts.constraints.clone();
+    self.paths.push(initial_path);
+    self.current_step = 0;
+}
+\end{verbatim}
+\end{center}
+
+The procedure works in two phases. First, it records the type of every state variable and input by iterating over the transition system and inserting into \texttt{state\_types} and \texttt{input\_types}. These maps are consulted later whenever a fresh symbol of the correct width must be allocated.
+
+Second, it builds the single initial \texttt{ExecutionPath}. For each state variable the BTOR2 model provides an explicit \texttt{init} expression (e.g.\ \texttt{\_resetCount} $\gets 0$), that concrete value is used directly. For state variables with no explicit initializer (e.g.\ \texttt{counter}), a fresh unconstrained symbol is created with the suffix \texttt{\_t0} and registered in \texttt{all\_symbols}. This symbol represents the unknown initial value and will be treated as a free variable by the SMT solver. Finally, the system constraints are copied from the transition system and the single initial path is pushed onto \texttt{paths}.
 
 \subsection{Simplification}
 
