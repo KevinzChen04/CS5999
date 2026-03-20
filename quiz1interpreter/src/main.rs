@@ -1,7 +1,7 @@
 use clap::Parser;
 use patronus::expr::SerializableIrNode;
 use patronus::smt::{Solver, Z3};
-use quiz1interpreter::SymbolicExecutor;
+use quiz1interpreter::{StepResult, SymbolicExecutor};
 
 #[derive(Parser)]
 #[command(name = "quiz1interpreter")]
@@ -31,13 +31,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     executor.init(&mut ctx);
 
     // Print initial state (Step 0)
-    executor.print_step(&mut ctx);
+    // executor.print_step(&mut ctx);
 
     // Perform symbolic execution steps
     for _ in 0..cli.steps {
-        println!();
-        executor.step(&mut ctx, &mut solver);
-        executor.print_step(&mut ctx);
+        // println!();
+        let result = executor.step(&mut ctx, &mut solver);
+        if result == StepResult::BadStateReached {
+            executor.print_step(&mut ctx);
+            break;
+        }
     }
 
     Ok(())

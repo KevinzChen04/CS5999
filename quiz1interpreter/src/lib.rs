@@ -1,7 +1,7 @@
 use patronus;
 
 pub mod symbolic_executor;
-pub use symbolic_executor::{ExecutionPath, SymbolicExecutor};
+pub use symbolic_executor::{ExecutionPath, StepResult, SymbolicExecutor};
 
 /// Loads a BTOR2 file and returns the context and transition system
 ///
@@ -37,6 +37,6 @@ mod tests {
         
         let mut executor = SymbolicExecutor::new(&ts);
         executor.init(&mut ctx);
-        executor.step(&mut ctx, &mut solver);
+        let _ = executor.step(&mut ctx, &mut solver);
     }
 }

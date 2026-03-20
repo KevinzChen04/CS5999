@@ -3,6 +3,12 @@ use patronus::smt::{CheckSatResponse, SolverContext};
 use patronus::system::TransitionSystem;
 use std::collections::{HashMap, HashSet};
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StepResult {
+    Ok,
+    BadStateReached,
+}
+
 #[derive(Clone)]
 pub struct ExecutionPath {
     pub state_translation: HashMap<ExprRef, ExprRef>,
@@ -53,6 +59,7 @@ pub struct SymbolicExecutor {
     input_types: HashMap<ExprRef, Type>,
     all_symbols: HashSet<ExprRef>,
     constraints: Vec<ExprRef>,
+    bad_state: Option<(ExprRef, ExecutionPath)>,
 }
 
 impl SymbolicExecutor {
@@ -65,6 +72,7 @@ impl SymbolicExecutor {
             input_types: HashMap::new(),
             all_symbols: HashSet::new(),
             constraints: Vec::new(),
+            bad_state: None,
         }
     }
 
@@ -272,7 +280,11 @@ impl SymbolicExecutor {
         }
     }
 
-    pub fn step<S: SolverContext>(&mut self, ctx: &mut Context, solver: &mut S) {
+    pub fn step<S: SolverContext>(&mut self, ctx: &mut Context, solver: &mut S) -> StepResult {
+        if self.bad_state.is_some() {
+            return StepResult::BadStateReached;
+        }
+
         self.current_step += 1;
         let next_step = self.current_step;
         
@@ -361,11 +373,53 @@ impl SymbolicExecutor {
         }
 
         self.paths = merged_paths;
+
+        // Check whether any bad state is satisfiable on any path after this step.
+        let bad_states = self.ts.bad_states.clone();
+        let mut found_bad: Option<(ExprRef, ExecutionPath)> = None;
+
+        'outer: for &bad_expr in &bad_states {
+            for path in &self.paths {
+                if self.check_condition_sat(ctx, solver, path, bad_expr) == Some(true) {
+                    found_bad = Some((bad_expr, path.clone()));
+                    break 'outer;
+                }
+            }
+        }
+
+        if let Some(bad) = found_bad {
+            self.bad_state = Some(bad);
+            return StepResult::BadStateReached;
+        }
+
+        StepResult::Ok
     }
 
 
+    fn print_bad_state(&self, ctx: &mut Context) {
+        if let Some((bad_expr, ref bad_path)) = self.bad_state {
+            println!("  === BAD STATE reached at step {} ===", self.current_step);
+            println!("  Bad state expression: {}", bad_expr.serialize_to_str(ctx));
+            let substituted = self.substitute_expr(ctx, bad_expr, bad_path);
+            let simplified = simplify_single_expression(ctx, substituted);
+            println!("  Evaluated: {}", simplified.serialize_to_str(ctx));
+            println!("  Path condition:");
+            for &cond in &bad_path.path_conditions {
+                let sub = self.substitute_expr(ctx, cond, bad_path);
+                let simp = simplify_single_expression(ctx, sub);
+                println!("    {}", simp.serialize_to_str(ctx));
+            }
+        }
+    }
+
     pub fn print_step(&self, ctx: &mut Context) {
         println!("Step {}:", self.current_step);
+
+        if self.bad_state.is_some() {
+            self.print_bad_state(ctx);
+            println!();
+            return;
+        }
 
         println!("  All symbols:");
         for sym in &self.all_symbols {
