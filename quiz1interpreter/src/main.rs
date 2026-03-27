@@ -9,9 +9,6 @@ use quiz1interpreter::{StepResult, SymbolicExecutor};
 struct Cli {
     /// Path to the BTOR2 file
     input_path: String,
-    /// Path for the output VCD file
-    #[arg(short, long)]
-    output_path: String,
     /// Number of symbolic execution steps to perform
     #[arg(short, long, default_value = "2")]
     steps: usize,
@@ -36,6 +33,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Perform symbolic execution steps
     for _ in 0..cli.steps {
         // println!();
+        executor.print_step(&mut ctx);
         let result = executor.step(&mut ctx, &mut solver);
         if result == StepResult::BadStateReached {
             executor.print_step(&mut ctx);

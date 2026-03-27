@@ -12,18 +12,23 @@ pub enum StepResult {
 #[derive(Clone)]
 pub struct ExecutionPath {
     pub state_translation: HashMap<ExprRef, ExprRef>,
+    /// State values before the most recent transition, used to evaluate system
+    /// constraints together with the current inputs (constraints relate
+    /// pre-transition state to the inputs that drive the transition).
+    pub pre_transition_state: HashMap<ExprRef, ExprRef>,
     pub path_conditions: Vec<ExprRef>,
     pub input_translation: HashMap<ExprRef, ExprRef>,
-    pub new_state_cache: HashMap<ExprRef, ExprRef>,
+    pub post_transition_state: HashMap<ExprRef, ExprRef>,
 }
 
 impl ExecutionPath {
     pub fn new() -> Self {
         ExecutionPath {
             state_translation: HashMap::new(),
+            pre_transition_state: HashMap::new(),
             path_conditions: Vec::new(),
             input_translation: HashMap::new(),
-            new_state_cache: HashMap::new(),
+            post_transition_state: HashMap::new(),
         }
     }
 
@@ -163,9 +168,24 @@ impl SymbolicExecutor {
             let _ = solver.assert(ctx, simplified);
         }
 
+        // Constraints relate the pre-transition state to the inputs that drove
+        // the transition, so substitute state variables with pre_transition_state
+        // (falling back to state_translation for paths that have no prior step).
+        let constraint_state = if path.pre_transition_state.is_empty() {
+            &path.state_translation
+        } else {
+            &path.pre_transition_state
+        };
+        let constraint_path = ExecutionPath {
+            state_translation: constraint_state.clone(),
+            pre_transition_state: HashMap::new(),
+            path_conditions: Vec::new(),
+            input_translation: path.input_translation.clone(),
+            post_transition_state: HashMap::new(),
+        };
         let constraints = self.constraints.clone();
         for &constraint in &constraints {
-            let substituted = self.substitute_expr(ctx, constraint, &path);
+            let substituted = self.substitute_expr(ctx, constraint, &constraint_path);
             let simplified = simplify_single_expression(ctx, substituted);
             let _ = solver.assert(ctx, simplified);
         }
@@ -196,9 +216,13 @@ impl SymbolicExecutor {
         while i < path_stack.len() {
 
             let substituted = self.substitute_expr(ctx, next_expr, &path_stack[i]);
-            let simplified = simplify_single_expression(ctx, substituted);
-            let new_state = self.resolve_ite(ctx, solver, i, path_stack, simplified);
-            path_stack[i].new_state_cache.insert(state_symbol, new_state);
+            // Simplify only AFTER resolve_ite so that ITE structure is preserved
+            // during feasibility pruning. Pre-simplification converts 1-bit ITEs
+            // like ite(A, 0, B) into and(not(A), B), hiding the outer condition
+            // from resolve_ite and causing spurious path forks.
+            let new_state = self.resolve_ite(ctx, solver, i, path_stack, substituted);
+            let simplified = simplify_single_expression(ctx, new_state);
+            path_stack[i].post_transition_state.insert(state_symbol, simplified);
 
             i += 1;
         }
@@ -312,6 +336,9 @@ impl SymbolicExecutor {
             base_path.path_conditions = path.path_conditions.clone();
             base_path.input_translation = timestamped_inputs.clone();
             base_path.state_translation = path.state_translation.clone();
+            // Snapshot pre-transition state so constraints can be evaluated
+            // against the state values that were current when inputs were applied.
+            base_path.pre_transition_state = path.state_translation.clone();
 
             let mut path_stack = vec![base_path];
 
@@ -322,7 +349,7 @@ impl SymbolicExecutor {
             }
 
             for p in path_stack.iter_mut() {
-                for (key, value) in p.new_state_cache.iter() {
+                for (key, value) in p.post_transition_state.iter() {
                     p.state_translation.insert(*key, *value);
                 }
             }
@@ -374,14 +401,41 @@ impl SymbolicExecutor {
 
         self.paths = merged_paths;
 
+        // Bad states are checked at time N with state@N and inputs@N.
+        // The path's input_translation holds inputs@(N-1) (the transition inputs),
+        // so we create fresh inputs timestamped at next_step for the bad state check.
+        let mut bad_check_inputs = HashMap::new();
+        for input in &self.ts.inputs {
+            let original_name = ctx.get_symbol_name(*input).unwrap_or("input");
+            let timestamped_name = format!("{}_t{}", original_name, next_step);
+            let tpe = self.input_types[input];
+            let timestamped_sym = match tpe {
+                Type::BV(width) => ctx.bv_symbol(&timestamped_name, width),
+                Type::Array(arr_type) => {
+                    ctx.array_symbol(&timestamped_name, arr_type.index_width, arr_type.data_width)
+                }
+            };
+            bad_check_inputs.insert(*input, timestamped_sym);
+            self.all_symbols.insert(timestamped_sym);
+        }
+
         // Check whether any bad state is satisfiable on any path after this step.
         let bad_states = self.ts.bad_states.clone();
         let mut found_bad: Option<(ExprRef, ExecutionPath)> = None;
 
         'outer: for &bad_expr in &bad_states {
             for path in &self.paths {
-                if self.check_condition_sat(ctx, solver, path, bad_expr) == Some(true) {
-                    found_bad = Some((bad_expr, path.clone()));
+                // Build a check path: state@N with fresh inputs@N.
+                // pre_transition_state = state@N so constraints are evaluated at time N.
+                let bad_check_path = ExecutionPath {
+                    state_translation: path.state_translation.clone(),
+                    pre_transition_state: path.state_translation.clone(),
+                    path_conditions: path.path_conditions.clone(),
+                    input_translation: bad_check_inputs.clone(),
+                    post_transition_state: HashMap::new(),
+                };
+                if self.check_condition_sat(ctx, solver, &bad_check_path, bad_expr) == Some(true) {
+                    found_bad = Some((bad_expr, bad_check_path));
                     break 'outer;
                 }
             }

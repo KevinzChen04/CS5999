@@ -25,14 +25,14 @@ mod tests {
 
     #[test]
     fn test_symbolic_executor_init() {
-        let (mut ctx, ts) = load_btor2_file("Quiz1.btor").expect("Failed to load BTOR2 file");
+        let (mut ctx, ts) = load_btor2_file("tests/fixtures/Quiz1.btor").expect("Failed to load BTOR2 file");
         let mut executor = SymbolicExecutor::new(&ts);
         executor.init(&mut ctx);
     }
     
     #[test]
     fn test_symbolic_executor_step() {
-        let (mut ctx, ts) = load_btor2_file("Quiz1.btor").expect("Failed to load BTOR2 file");
+        let (mut ctx, ts) = load_btor2_file("tests/fixtures/Quiz1.btor").expect("Failed to load BTOR2 file");
         let mut solver = Z3.start(None::<std::fs::File>).expect("Failed to start solver");
         
         let mut executor = SymbolicExecutor::new(&ts);
