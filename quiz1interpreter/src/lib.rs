@@ -1,7 +1,7 @@
 use patronus;
 
 pub mod symbolic_executor;
-pub use symbolic_executor::{ExecutionPath, StepResult, SymbolicExecutor};
+pub use symbolic_executor::{ExecutionPath, ExecutionStats, StepResult, SymbolicExecutor};
 
 /// Loads a BTOR2 file and returns the context and transition system
 ///

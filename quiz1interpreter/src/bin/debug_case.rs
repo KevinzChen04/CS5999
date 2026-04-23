@@ -50,7 +50,7 @@ fn resolve_path(input: &str) -> PathBuf {
 
 // ── BMC run ───────────────────────────────────────────────────────────────────
 
-fn run_bmc_verbose(path: &str, k_max: usize) {
+fn run_bmc_verbose(path: &str, k_max: usize) -> Option<usize> {
     println!("┌─ BMC (patronus) ───────────────────────────────────────────┐");
 
     let (mut ctx, sys) = match load_btor2_file(path) {
@@ -58,7 +58,7 @@ fn run_bmc_verbose(path: &str, k_max: usize) {
         Err(e) => {
             println!("  ERROR loading file: {e}");
             println!("└────────────────────────────────────────────────────────────┘\n");
-            return;
+            return None;
         }
     };
 
@@ -74,6 +74,8 @@ fn run_bmc_verbose(path: &str, k_max: usize) {
             println!("  Result  : UNSAFE");
             println!("  Bad step: k = {failing_step}");
             println!("  Witness : {} input frame(s)", witness.inputs.len());
+            println!("└────────────────────────────────────────────────────────────┘\n");
+            return Some(failing_step);
         }
         Ok(ModelCheckResult::Success) => {
             println!("  Result  : SAFE (no bad state within k = {k_max})");
@@ -87,11 +89,12 @@ fn run_bmc_verbose(path: &str, k_max: usize) {
     }
 
     println!("└────────────────────────────────────────────────────────────┘\n");
+    None
 }
 
 // ── Symbolic executor run ─────────────────────────────────────────────────────
 
-fn run_symbolic_verbose(path: &str, k_max: usize) {
+fn run_symbolic_verbose(path: &str, k_max: usize) -> Option<usize> {
     println!("┌─ SymbolicExecutor ─────────────────────────────────────────┐");
 
     let (mut ctx, ts) = match load_btor2_file(path) {
@@ -99,7 +102,7 @@ fn run_symbolic_verbose(path: &str, k_max: usize) {
         Err(e) => {
             println!("  ERROR loading file: {e}");
             println!("└────────────────────────────────────────────────────────────┘\n");
-            return;
+            return None;
         }
     };
 
@@ -116,57 +119,25 @@ fn run_symbolic_verbose(path: &str, k_max: usize) {
     print!("  ");
     executor.print_step(&mut ctx);
 
-    let mut found_bad = false;
-    for _step in 1..=k_max {
+    for step in 1..=k_max {
         let result = executor.step(&mut ctx, &mut solver);
         print!("  ");
         executor.print_step(&mut ctx);
         if result == StepResult::BadStateReached {
-            found_bad = true;
-            break;
+            println!("└────────────────────────────────────────────────────────────┘\n");
+            return Some(step);
         }
     }
 
-    if !found_bad {
-        println!("  Result: SAFE (no bad state within {} steps)", k_max);
-    }
+    println!("  Result: SAFE (no bad state within {} steps)", k_max);
 
     println!("└────────────────────────────────────────────────────────────┘\n");
+    None
 }
 
 // ── Summary comparison ────────────────────────────────────────────────────────
 
-fn run_summary(path: &str, k_max: usize) {
-    // BMC verdict
-    let bmc_verdict = {
-        let (mut ctx, sys) = load_btor2_file(path)
-            .unwrap_or_else(|e| panic!("failed to load '{}': {}", path, e));
-        let mut smt_ctx = Z3.start(None::<std::fs::File>).expect("Z3 start");
-        match bmc(&mut ctx, &mut smt_ctx, &sys, true, false, k_max as u64) {
-            Ok(ModelCheckResult::Fail(w)) => {
-                Some(w.inputs.len().saturating_sub(1))
-            }
-            _ => None,
-        }
-    };
-
-    // Symbolic verdict
-    let sym_verdict = {
-        let (mut ctx, ts) = load_btor2_file(path)
-            .unwrap_or_else(|e| panic!("failed to load '{}': {}", path, e));
-        let mut solver = Z3.start(None::<std::fs::File>).expect("Z3 start");
-        let mut executor = SymbolicExecutor::new(&ts);
-        executor.init(&mut ctx);
-        let mut found = None;
-        for step in 1..=(k_max + 1) {
-            if executor.step(&mut ctx, &mut solver) == StepResult::BadStateReached {
-                found = Some(step);
-                break;
-            }
-        }
-        found
-    };
-
+fn run_summary(k_max: usize, bmc_verdict: Option<usize>, sym_verdict: Option<usize>) {
     println!("┌─ Summary ──────────────────────────────────────────────────┐");
     match (bmc_verdict, sym_verdict) {
         (None, None) => {
@@ -211,8 +182,8 @@ fn main() {
     println!("  Bound: {} steps", cli.steps);
     println!("═══════════════════════════════════════════════════════════════\n");
 
-    run_bmc_verbose(&path_str, cli.steps);
-    run_symbolic_verbose(&path_str, cli.steps);
-    run_summary(&path_str, cli.steps);
+    let bmc_verdict = run_bmc_verbose(&path_str, cli.steps);
+    let sym_verdict = run_symbolic_verbose(&path_str, cli.steps);
+    run_summary(cli.steps, bmc_verdict, sym_verdict);
     println!();
 }

@@ -9,6 +9,23 @@ pub enum StepResult {
     BadStateReached,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct ExecutionStats {
+    /// Total number of ITE nodes encountered during symbolic execution.
+    /// This is the requested "branching path" count regardless of feasibility/forking.
+    pub ite_encountered: usize,
+    /// Number of calls to `check_condition_sat` (proxy for SMT calls).
+    pub smt_calls: usize,
+    /// Number of states in the transition system.
+    pub state_variables: usize,
+    /// Number of transition statements (`state.next` present).
+    pub transition_statements: usize,
+    /// Cumulative number of paths generated before merge over all steps.
+    pub total_paths_generated: usize,
+    /// Number of active paths after the most recent merge.
+    pub active_paths: usize,
+}
+
 #[derive(Clone)]
 pub struct ExecutionPath {
     pub state_translation: HashMap<ExprRef, ExprRef>,
@@ -65,6 +82,7 @@ pub struct SymbolicExecutor {
     all_symbols: HashSet<ExprRef>,
     constraints: Vec<ExprRef>,
     bad_state: Option<(ExprRef, ExecutionPath)>,
+    stats: ExecutionStats,
 }
 
 impl SymbolicExecutor {
@@ -78,10 +96,15 @@ impl SymbolicExecutor {
             all_symbols: HashSet::new(),
             constraints: Vec::new(),
             bad_state: None,
+            stats: ExecutionStats::default(),
         }
     }
 
     pub fn init(&mut self, ctx: &mut Context) {
+        self.stats = ExecutionStats::default();
+        self.stats.state_variables = self.ts.states.len();
+        self.stats.transition_statements = self.ts.states.iter().filter(|s| s.next.is_some()).count();
+
         for state in &self.ts.states {
             let tpe = state.symbol.get_type(ctx);
             self.state_types.insert(state.symbol, tpe);
@@ -117,6 +140,7 @@ impl SymbolicExecutor {
 
         self.paths.push(initial_path);
         self.current_step = 0;
+        self.stats.active_paths = self.paths.len();
     }
 
     fn substitute_expr(
@@ -148,12 +172,13 @@ impl SymbolicExecutor {
     }
 
     fn check_condition_sat<S: SolverContext>(
-        &self,
+        &mut self,
         ctx: &mut Context,
         solver: &mut S,
         path: &ExecutionPath,
         condition: ExprRef,
     ) -> Option<bool> {
+        self.stats.smt_calls += 1;
         if solver.push().is_err() {
             return None;
         }
@@ -205,7 +230,7 @@ impl SymbolicExecutor {
     }
 
     fn explore_paths<S: SolverContext>(
-        &self,
+        &mut self,
         ctx: &mut Context,
         solver: &mut S,
         path_stack: &mut Vec<ExecutionPath>,
@@ -237,7 +262,7 @@ impl SymbolicExecutor {
     ///   later re-evaluation by `explore_paths` (with `¬cond` in its conditions).
     /// - If neither branch is feasible, the path is infeasible (panic).
     fn resolve_ite<S: SolverContext>(
-        &self,
+        &mut self,
         ctx: &mut Context,
         solver: &mut S,
         i: usize,
@@ -245,6 +270,7 @@ impl SymbolicExecutor {
         expr: ExprRef,
     ) -> ExprRef {
         if let Some((cond, tru, fals)) = self.get_ite_components(ctx, expr) {
+            self.stats.ite_encountered += 1;
             let cond_sat = self.check_condition_sat(ctx, solver, &path_stack[i], cond);
             let neg_cond = ctx.not(cond);
             let neg_sat = self.check_condition_sat(ctx, solver, &path_stack[i], neg_cond);
@@ -331,7 +357,8 @@ impl SymbolicExecutor {
             self.all_symbols.insert(timestamped_sym);
         }
 
-        for path in &self.paths {
+        let previous_paths = self.paths.clone();
+        for path in &previous_paths {
             let mut base_path = ExecutionPath::new();
             base_path.path_conditions = path.path_conditions.clone();
             base_path.input_translation = timestamped_inputs.clone();
@@ -356,6 +383,7 @@ impl SymbolicExecutor {
 
             new_paths.extend(path_stack);
         }
+        self.stats.total_paths_generated += new_paths.len();
 
 
         let mut merged_paths: Vec<ExecutionPath> = Vec::new();
@@ -400,6 +428,7 @@ impl SymbolicExecutor {
         }
 
         self.paths = merged_paths;
+        self.stats.active_paths = self.paths.len();
 
         // Bad states are checked at time N with state@N and inputs@N.
         // The path's input_translation holds inputs@(N-1) (the transition inputs),
@@ -423,8 +452,9 @@ impl SymbolicExecutor {
         let bad_states = self.ts.bad_states.clone();
         let mut found_bad: Option<(ExprRef, ExecutionPath)> = None;
 
+        let paths_for_bad_check = self.paths.clone();
         'outer: for &bad_expr in &bad_states {
-            for path in &self.paths {
+            for path in &paths_for_bad_check {
                 // Build a check path: state@N with fresh inputs@N.
                 // pre_transition_state = state@N so constraints are evaluated at time N.
                 let bad_check_path = ExecutionPath {
@@ -447,6 +477,10 @@ impl SymbolicExecutor {
         }
 
         StepResult::Ok
+    }
+
+    pub fn stats(&self) -> &ExecutionStats {
+        &self.stats
     }
 
 

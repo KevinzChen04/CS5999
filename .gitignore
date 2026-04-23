@@ -15,5 +15,5 @@ output.*
 *.fls
 *.blg
 *.gz
-
+*.smt2
 

@@ -1,1 +1,2 @@
 cargo run -- --output-path Quiz1.fst --steps 3 Quiz1.btor
+cargo run --bin debug_case -- ./simple_spi.btor --steps 1
