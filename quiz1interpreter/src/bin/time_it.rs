@@ -152,6 +152,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if cli.debug {
         println!();
         println!("--- Debug stats ---");
+        println!("ITE (static)      : {}", sym_stats.static_ite_count);
         println!("ITE encountered   : {}", sym_stats.ite_encountered);
         println!("SMT calls         : {}", sym_stats.smt_calls);
         println!("State variables   : {}", sym_stats.state_variables);

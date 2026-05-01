@@ -1,2 +1,3 @@
-cargo run -- --output-path Quiz1.fst --steps 3 Quiz1.btor
-cargo run --bin debug_case -- ./simple_spi.btor --steps 1
+cargo run --release -- --output-path Quiz1.fst --steps 3 Quiz1.btor
+cargo run --release --bin debug_case -- ./simple_spi.btor --steps 1
+cargo run --release --bin time_it -- ./simple_spi.btor --steps 1 --debug

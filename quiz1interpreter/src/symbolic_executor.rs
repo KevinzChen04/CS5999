@@ -20,6 +20,8 @@ pub struct ExecutionStats {
     pub state_variables: usize,
     /// Number of transition statements (`state.next` present).
     pub transition_statements: usize,
+    /// Total number of unique ITE nodes in the transition system (static, pre-execution).
+    pub static_ite_count: usize,
     /// Cumulative number of paths generated before merge over all steps.
     pub total_paths_generated: usize,
     /// Number of active paths after the most recent merge.
@@ -34,8 +36,14 @@ pub struct ExecutionPath {
     /// pre-transition state to the inputs that drive the transition).
     pub pre_transition_state: HashMap<ExprRef, ExprRef>,
     pub path_conditions: Vec<ExprRef>,
+    /// Pre-computed substituted+simplified forms of `path_conditions`, ready to
+    /// assert directly to the solver without any further processing.
+    pub asserted_path_conditions: Vec<ExprRef>,
     pub input_translation: HashMap<ExprRef, ExprRef>,
     pub post_transition_state: HashMap<ExprRef, ExprRef>,
+    /// Pre-computed substituted+simplified system constraints for this path's
+    /// state/input context, ready to assert directly to the solver.
+    pub asserted_constraints: Vec<ExprRef>,
 }
 
 impl ExecutionPath {
@@ -44,8 +52,10 @@ impl ExecutionPath {
             state_translation: HashMap::new(),
             pre_transition_state: HashMap::new(),
             path_conditions: Vec::new(),
+            asserted_path_conditions: Vec::new(),
             input_translation: HashMap::new(),
             post_transition_state: HashMap::new(),
+            asserted_constraints: Vec::new(),
         }
     }
 
@@ -80,6 +90,10 @@ pub struct SymbolicExecutor {
     state_types: HashMap<ExprRef, Type>,
     input_types: HashMap<ExprRef, Type>,
     all_symbols: HashSet<ExprRef>,
+    /// Symbols added since the last time they were declared to the solver.
+    /// Drained at the start of `check_condition_sat` (before any push) so
+    /// that declarations live at solver level 0 and survive push/pop cycles.
+    pending_declarations: Vec<ExprRef>,
     constraints: Vec<ExprRef>,
     bad_state: Option<(ExprRef, ExecutionPath)>,
     stats: ExecutionStats,
@@ -94,16 +108,40 @@ impl SymbolicExecutor {
             state_types: HashMap::new(),
             input_types: HashMap::new(),
             all_symbols: HashSet::new(),
+            pending_declarations: Vec::new(),
             constraints: Vec::new(),
             bad_state: None,
             stats: ExecutionStats::default(),
         }
     }
 
+    fn count_static_ites(ctx: &Context, ts: &TransitionSystem) -> usize {
+        let mut visited: HashSet<ExprRef> = HashSet::new();
+        let mut worklist: Vec<ExprRef> = Vec::new();
+        for state in &ts.states {
+            if let Some(next) = state.next { worklist.push(next); }
+            if let Some(init) = state.init { worklist.push(init); }
+        }
+        for &bad in &ts.bad_states { worklist.push(bad); }
+        for &c in &ts.constraints { worklist.push(c); }
+
+        let mut count = 0usize;
+        while let Some(expr) = worklist.pop() {
+            if !visited.insert(expr) { continue; }
+            match &ctx[expr] {
+                Expr::BVIte { .. } | Expr::ArrayIte { .. } => count += 1,
+                _ => {}
+            }
+            ctx[expr].for_each_child(|c| worklist.push(*c));
+        }
+        count
+    }
+
     pub fn init(&mut self, ctx: &mut Context) {
         self.stats = ExecutionStats::default();
         self.stats.state_variables = self.ts.states.len();
         self.stats.transition_statements = self.ts.states.iter().filter(|s| s.next.is_some()).count();
+        self.stats.static_ite_count = Self::count_static_ites(ctx, &self.ts);
 
         for state in &self.ts.states {
             let tpe = state.symbol.get_type(ctx);
@@ -132,7 +170,9 @@ impl SymbolicExecutor {
                     }
                 };
                 initial_path.state_translation.insert(state.symbol, t0_sym);
-                self.all_symbols.insert(t0_sym);
+                if self.all_symbols.insert(t0_sym) {
+                    self.pending_declarations.push(t0_sym);
+                }
             }
         }
 
@@ -163,6 +203,34 @@ impl SymbolicExecutor {
         })
     }
 
+    /// Pre-compute substituted+simplified system constraints for a given state/input context.
+    /// The substitution uses `state_map` (typically pre_transition_state) and `input_map`.
+    fn precompute_constraints(
+        &self,
+        ctx: &mut Context,
+        state_map: &HashMap<ExprRef, ExprRef>,
+        input_map: &HashMap<ExprRef, ExprRef>,
+    ) -> Vec<ExprRef> {
+        // Build a temporary path carrying only the maps needed for substitution.
+        let sub_path = ExecutionPath {
+            state_translation: state_map.clone(),
+            pre_transition_state: HashMap::new(),
+            path_conditions: Vec::new(),
+            asserted_path_conditions: Vec::new(),
+            input_translation: input_map.clone(),
+            post_transition_state: HashMap::new(),
+            asserted_constraints: Vec::new(),
+        };
+        let constraints = self.constraints.clone();
+        let mut result = Vec::with_capacity(constraints.len());
+        for &c in &constraints {
+            let sub = self.substitute_expr(ctx, c, &sub_path);
+            let simplified = simplify_single_expression(ctx, sub);
+            result.push(simplified);
+        }
+        result
+    }
+
     fn get_ite_components(&self, ctx: &Context, expr: ExprRef) -> Option<(ExprRef, ExprRef, ExprRef)> {
         match &ctx[expr] {
             Expr::BVIte { cond, tru, fals } => Some((*cond, *tru, *fals)),
@@ -171,6 +239,12 @@ impl SymbolicExecutor {
         }
     }
 
+    /// Check whether `condition` is satisfiable under the current path context.
+    ///
+    /// Symbols are declared at solver level 0 (before any push) via `pending_declarations`
+    /// so that they survive push/pop cycles and are never re-declared needlessly.
+    /// Path conditions and system constraints are asserted from pre-computed fields on
+    /// the path, avoiding repeated substitution and simplification work.
     fn check_condition_sat<S: SolverContext>(
         &mut self,
         ctx: &mut Context,
@@ -179,40 +253,26 @@ impl SymbolicExecutor {
         condition: ExprRef,
     ) -> Option<bool> {
         self.stats.smt_calls += 1;
+
+        // Declare any symbols that have been added since the last call.
+        // This happens at the base solver level (before push) so the declarations
+        // are permanent and survive all subsequent push/pop pairs.
+        for sym in self.pending_declarations.drain(..) {
+            let _ = solver.declare_const(ctx, sym);
+        }
+
         if solver.push().is_err() {
             return None;
         }
 
-        for sym in &self.all_symbols {
-            let _ = solver.declare_const(ctx, *sym);
-        }
-        
-        for &pc in &path.path_conditions {
-            let substituted = self.substitute_expr(ctx, pc, path);
-            let simplified = simplify_single_expression(ctx, substituted);
-            let _ = solver.assert(ctx, simplified);
+        // Assert pre-computed path conditions — no substitution or simplification needed.
+        for &pc in &path.asserted_path_conditions {
+            let _ = solver.assert(ctx, pc);
         }
 
-        // Constraints relate the pre-transition state to the inputs that drove
-        // the transition, so substitute state variables with pre_transition_state
-        // (falling back to state_translation for paths that have no prior step).
-        let constraint_state = if path.pre_transition_state.is_empty() {
-            &path.state_translation
-        } else {
-            &path.pre_transition_state
-        };
-        let constraint_path = ExecutionPath {
-            state_translation: constraint_state.clone(),
-            pre_transition_state: HashMap::new(),
-            path_conditions: Vec::new(),
-            input_translation: path.input_translation.clone(),
-            post_transition_state: HashMap::new(),
-        };
-        let constraints = self.constraints.clone();
-        for &constraint in &constraints {
-            let substituted = self.substitute_expr(ctx, constraint, &constraint_path);
-            let simplified = simplify_single_expression(ctx, substituted);
-            let _ = solver.assert(ctx, simplified);
+        // Assert pre-computed system constraints — no substitution or simplification needed.
+        for &c in &path.asserted_constraints {
+            let _ = solver.assert(ctx, c);
         }
 
         let substituted_cond = self.substitute_expr(ctx, condition, path);
@@ -283,9 +343,17 @@ impl SymbolicExecutor {
                     self.resolve_ite(ctx, solver, i, path_stack, fals)
                 }
                 (Some(true), Some(true)) => {
+                    // Fork: path i takes the true branch, a clone takes the false branch.
+                    // Pre-compute the simplified assertion form at insertion time so that
+                    // check_condition_sat never needs to re-substitute or re-simplify.
+                    let simplified_cond = simplify_single_expression(ctx, cond);
+                    let simplified_neg = simplify_single_expression(ctx, neg_cond);
+
                     let mut forked_path = path_stack[i].clone();
                     path_stack[i].path_conditions.push(cond);
+                    path_stack[i].asserted_path_conditions.push(simplified_cond);
                     forked_path.path_conditions.push(neg_cond);
+                    forked_path.asserted_path_conditions.push(simplified_neg);
                     path_stack.push(forked_path);
                     self.resolve_ite(ctx, solver, i, path_stack, tru)
                 }
@@ -354,18 +422,30 @@ impl SymbolicExecutor {
                 }
             };
             timestamped_inputs.insert(*input, timestamped_sym);
-            self.all_symbols.insert(timestamped_sym);
+            if self.all_symbols.insert(timestamped_sym) {
+                self.pending_declarations.push(timestamped_sym);
+            }
         }
 
         let previous_paths = self.paths.clone();
         for path in &previous_paths {
             let mut base_path = ExecutionPath::new();
             base_path.path_conditions = path.path_conditions.clone();
+            base_path.asserted_path_conditions = path.asserted_path_conditions.clone();
             base_path.input_translation = timestamped_inputs.clone();
             base_path.state_translation = path.state_translation.clone();
             // Snapshot pre-transition state so constraints can be evaluated
             // against the state values that were current when inputs were applied.
             base_path.pre_transition_state = path.state_translation.clone();
+
+            // Pre-compute system constraints substituted with this path's context.
+            // All forks produced by explore_paths share the same pre_transition_state
+            // and input_translation, so they all inherit this pre-computed result.
+            base_path.asserted_constraints = self.precompute_constraints(
+                ctx,
+                &base_path.pre_transition_state,
+                &base_path.input_translation,
+            );
 
             let mut path_stack = vec![base_path];
 
@@ -386,43 +466,44 @@ impl SymbolicExecutor {
         self.stats.total_paths_generated += new_paths.len();
 
 
+        // Merge paths that reached the same post-transition state.
+        // Use a HashMap keyed on a sorted representation of state_translation for O(n) lookup
+        // instead of the previous O(n²) nested scan.
+        let mut state_key_to_idx: HashMap<Vec<(ExprRef, ExprRef)>, usize> = HashMap::new();
         let mut merged_paths: Vec<ExecutionPath> = Vec::new();
 
         for path in new_paths {
-            let mut found_match = false;
+            let mut key: Vec<(ExprRef, ExprRef)> = path.state_translation
+                .iter()
+                .map(|(&k, &v)| (k, v))
+                .collect();
+            key.sort_unstable();
 
-            for existing in merged_paths.iter_mut() {
-                let states_match = existing.state_translation.len() == path.state_translation.len()
-                    && existing.state_translation.iter().all(|(k, v)| {
-                        path.state_translation.get(k) == Some(v)
-                    });
+            if let Some(&idx) = state_key_to_idx.get(&key) {
+                let existing = &mut merged_paths[idx];
 
-                if states_match {
-                    let cond_existing = if existing.path_conditions.is_empty() {
-                        ctx.get_true()
-                    } else {
-                        existing.path_conditions.iter().copied()
-                            .reduce(|a, b| ctx.and(a, b))
-                            .unwrap()
-                    };
+                let cond_existing = if existing.path_conditions.is_empty() {
+                    ctx.get_true()
+                } else {
+                    existing.path_conditions.iter().copied()
+                        .reduce(|a, b| ctx.and(a, b))
+                        .unwrap()
+                };
 
-                    let cond_new = if path.path_conditions.is_empty() {
-                        ctx.get_true()
-                    } else {
-                        path.path_conditions.iter().copied()
-                            .reduce(|a, b| ctx.and(a, b))
-                            .unwrap()
-                    };
+                let cond_new = if path.path_conditions.is_empty() {
+                    ctx.get_true()
+                } else {
+                    path.path_conditions.iter().copied()
+                        .reduce(|a, b| ctx.and(a, b))
+                        .unwrap()
+                };
 
-                    let merged_cond = ctx.or(cond_existing, cond_new);
-                    existing.path_conditions = vec![merged_cond];
-
-                    found_match = true;
-                    break;
-                }
-            }
-
-            if !found_match {
+                let merged_cond = ctx.or(cond_existing, cond_new);
+                let simplified_merged = simplify_single_expression(ctx, merged_cond);
+                existing.path_conditions = vec![merged_cond];
+                existing.asserted_path_conditions = vec![simplified_merged];
+            } else {
+                state_key_to_idx.insert(key, merged_paths.len());
                 merged_paths.push(path);
             }
         }
@@ -445,7 +526,9 @@ impl SymbolicExecutor {
                 }
             };
             bad_check_inputs.insert(*input, timestamped_sym);
-            self.all_symbols.insert(timestamped_sym);
+            if self.all_symbols.insert(timestamped_sym) {
+                self.pending_declarations.push(timestamped_sym);
+            }
         }
 
         // Check whether any bad state is satisfiable on any path after this step.
@@ -457,12 +540,19 @@ impl SymbolicExecutor {
             for path in &paths_for_bad_check {
                 // Build a check path: state@N with fresh inputs@N.
                 // pre_transition_state = state@N so constraints are evaluated at time N.
+                let bad_asserted_constraints = self.precompute_constraints(
+                    ctx,
+                    &path.state_translation,
+                    &bad_check_inputs,
+                );
                 let bad_check_path = ExecutionPath {
                     state_translation: path.state_translation.clone(),
                     pre_transition_state: path.state_translation.clone(),
                     path_conditions: path.path_conditions.clone(),
+                    asserted_path_conditions: path.asserted_path_conditions.clone(),
                     input_translation: bad_check_inputs.clone(),
                     post_transition_state: HashMap::new(),
+                    asserted_constraints: bad_asserted_constraints,
                 };
                 if self.check_condition_sat(ctx, solver, &bad_check_path, bad_expr) == Some(true) {
                     found_bad = Some((bad_expr, bad_check_path));
