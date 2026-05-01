@@ -252,14 +252,30 @@ impl SymbolicExecutor {
         path: &ExecutionPath,
         condition: ExprRef,
     ) -> Option<bool> {
-        self.stats.smt_calls += 1;
-
         // Declare any symbols that have been added since the last call.
         // This happens at the base solver level (before push) so the declarations
         // are permanent and survive all subsequent push/pop pairs.
         for sym in self.pending_declarations.drain(..) {
             let _ = solver.declare_const(ctx, sym);
         }
+
+        // Substitute and simplify first — required for conditions that are not yet
+        // in the substituted domain (e.g. bad-state expressions).
+        let substituted_cond = self.substitute_expr(ctx, condition, path);
+        let simplified_cond = simplify_single_expression(ctx, substituted_cond);
+
+        // Short-circuit: if the condition simplifies to a literal, no solver call needed.
+        // This is sound because path consistency is maintained by construction.
+        if simplified_cond == ctx.get_true()  {
+            self.stats.smt_calls += 1;
+            return Some(true);
+        }
+        if simplified_cond == ctx.get_false() {
+            self.stats.smt_calls += 1;
+            return Some(false);
+        }
+
+        self.stats.smt_calls += 1;
 
         if solver.push().is_err() {
             return None;
@@ -275,8 +291,6 @@ impl SymbolicExecutor {
             let _ = solver.assert(ctx, c);
         }
 
-        let substituted_cond = self.substitute_expr(ctx, condition, path);
-        let simplified_cond = simplify_single_expression(ctx, substituted_cond);
         let _ = solver.assert(ctx, simplified_cond);
 
         let result = match solver.check_sat() {
@@ -333,7 +347,13 @@ impl SymbolicExecutor {
             self.stats.ite_encountered += 1;
             let cond_sat = self.check_condition_sat(ctx, solver, &path_stack[i], cond);
             let neg_cond = ctx.not(cond);
-            let neg_sat = self.check_condition_sat(ctx, solver, &path_stack[i], neg_cond);
+            // If cond is UNSAT under a consistent path, not(cond) must be SAT.
+            // Skip the second solver call in this common case.
+            let neg_sat = if cond_sat == Some(false) {
+                Some(true)
+            } else {
+                self.check_condition_sat(ctx, solver, &path_stack[i], neg_cond)
+            };
 
             match (cond_sat, neg_sat) {
                 (Some(true), Some(false)) => {
